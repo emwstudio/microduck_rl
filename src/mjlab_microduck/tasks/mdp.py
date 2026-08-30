@@ -7518,7 +7518,9 @@ def dance_beat_sync(
     move_id = term.move_id
 
     vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
-    roll_rate = torch.nan_to_num(asset.data.root_link_ang_vel_w[:, 3], nan=0.0)
+    # root_link_ang_vel_w is (N, 3) = ωx/ωy/ωz in world frame; while upright the
+    # world x-component IS the trunk roll rate (the reference's droll axis).
+    roll_rate = torch.nan_to_num(asset.data.root_link_ang_vel_w[:, 0], nan=0.0)
 
     # head_pitch joint velocity, measured through the backlash like
     # dance_joint_tracking (servo + passive play).
@@ -7552,10 +7554,11 @@ def dance_beat_sync(
     prev = getattr(env, "_dance_beat_sync_prev", None)
     if prev is None:
         prev = potential
-    # First step after a reset: no Δ to pay (prev := current → reward 0).
+    # First step after a reset: no Δ to pay — exactly 0 (not (γ−1)·Φ).
     first_step = env.episode_length_buf == 0
     prev = torch.where(first_step, potential, prev)
 
     reward = gamma * potential - prev
+    reward = torch.where(first_step, torch.zeros_like(reward), reward)
     env._dance_beat_sync_prev = potential.detach()
     return reward

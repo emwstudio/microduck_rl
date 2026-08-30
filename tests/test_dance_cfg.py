@@ -324,3 +324,187 @@ def test_nominal_height_is_the_measured_stand_z():
     # STAND_Z, shared with the standup/ball_kick envs — not the keyframe FK
     # height (0.12), which ignores contact compression.
     assert DANCE_NOMINAL_HEIGHT == 0.115
+
+
+# --------------------------------------------------------------------------- #
+# Reward functions against REAL mjlab data shapes (mock env, mock state)        #
+# --------------------------------------------------------------------------- #
+# Regression: dance_beat_sync once indexed root_link_ang_vel_w[:, 3] on a
+# (N, 3) tensor (IndexError at first reward computation on GPU). The mocks
+# below use the exact mjlab Entity.data shapes — root pose (N,3)/(N,4),
+# lin/ang vel (N,3), joint arrays (N, n_joints) — so any out-of-bounds index
+# in these three reward functions fails here on CPU.
+
+_SERVO_JOINT_NAMES = [
+    "left_hip_yaw", "left_hip_roll", "left_hip_pitch", "left_knee", "left_ankle",
+    "neck_pitch", "head_pitch", "head_yaw", "head_roll",
+    "right_hip_yaw", "right_hip_roll", "right_hip_pitch", "right_knee",
+    "right_ankle",
+]
+
+
+class _MockAssetData:
+    """Entity.data stand-in with the REAL mjlab tensor shapes."""
+
+    def __init__(self, n: int):
+        nj = len(_SERVO_JOINT_NAMES)
+        self.root_link_pos_w = torch.zeros(n, 3)
+        self.root_link_pos_w[:, 2] = DANCE_NOMINAL_HEIGHT
+        self.root_link_quat_w = torch.zeros(n, 4)
+        self.root_link_quat_w[:, 0] = 1.0
+        self.root_link_lin_vel_w = torch.zeros(n, 3)
+        self.root_link_ang_vel_w = torch.zeros(n, 3)  # (N, 3) — NOT (N, 6)
+        self.joint_pos = torch.zeros(n, nj)
+        self.joint_vel = torch.zeros(n, nj)
+        self.default_joint_pos = torch.zeros(n, nj)
+
+
+class _MockAsset:
+    def __init__(self, n: int):
+        self.data = _MockAssetData(n)
+        self.joint_names = list(_SERVO_JOINT_NAMES)
+
+    def find_joints_by_actuator_names(self, patterns):
+        import re
+
+        ids, names = [], []
+        for i, name in enumerate(self.joint_names):
+            if any(re.fullmatch(p, name) for p in patterns):
+                ids.append(i)
+                names.append(name)
+        return ids, names
+
+
+class _MockTerrain:
+    def __init__(self, n: int):
+        self.env_origins = torch.zeros(n, 3)
+
+
+class _MockScene:
+    def __init__(self, n: int):
+        self._robot = _MockAsset(n)
+        self.terrain = _MockTerrain(n)
+
+    def __getitem__(self, name):
+        assert name == "robot"
+        return self._robot
+
+
+class _MockCommandManager:
+    def __init__(self, term):
+        self._term = term
+
+    def get_term(self, name):
+        assert name == "body_pose"
+        return self._term
+
+
+class _MockRewardEnv:
+    """Minimal env exposing exactly what the dance rewards touch."""
+
+    def __init__(self, n: int = 6):
+        self.num_envs = n
+        self.device = "cpu"
+        self.scene = _MockScene(n)
+        self.command_manager = _MockCommandManager(
+            microduck_mdp.DanceCommand(microduck_mdp.DanceCommandCfg(), self)
+        )
+        self.episode_length_buf = torch.zeros(n, dtype=torch.long)
+        self.command_manager._term.reset(torch.arange(n))
+
+
+def test_dance_rewards_run_on_real_data_shapes():
+    env = _MockRewardEnv()
+    n = env.num_envs
+    for func in (
+        microduck_mdp.dance_body_tracking,
+        microduck_mdp.dance_joint_tracking,
+        microduck_mdp.dance_beat_sync,
+    ):
+        r = func(env, command_name="body_pose")
+        assert r.shape == (n,), (func.__name__, r.shape)
+        assert torch.isfinite(r).all(), func.__name__
+    # body/joint tracking are Gaussians in [0, 1]; beat_sync is a bounded
+    # potential difference in [-1, 1]
+    assert (microduck_mdp.dance_body_tracking(env) >= 0).all()
+    assert (microduck_mdp.dance_body_tracking(env) <= 1).all()
+    assert (microduck_mdp.dance_joint_tracking(env) >= 0).all()
+    assert (microduck_mdp.dance_joint_tracking(env) <= 1).all()
+    r = microduck_mdp.dance_beat_sync(env)
+    assert (r >= -1).all() and (r <= 1).all()
+
+
+def test_dance_beat_sync_first_step_after_reset_pays_zero():
+    env = _MockRewardEnv()
+    # episode_length_buf == 0 → prev := current → reward exactly 0
+    r = microduck_mdp.dance_beat_sync(env)
+    assert torch.all(r == 0.0)
+    # subsequent steps pay γΦ − Φ_prev (finite, bounded)
+    env.episode_length_buf += 1
+    r = microduck_mdp.dance_beat_sync(env)
+    assert torch.isfinite(r).all() and (r.abs() <= 1.0).all()
+
+
+def test_dance_rewards_track_their_reference_channels():
+    # A mock state exactly ON the reference must score higher than an
+    # off-reference state — proves the indices read the intended channels.
+    n = 4
+    env = _MockRewardEnv(n)
+    term = env.command_manager._term
+    asset = env.scene["robot"]
+
+    # Force every env to squat_bounce at the beat low point (φ = 0 mod 2π).
+    term._move_id[:] = microduck_mdp.DANCE_MOVE_SQUAT_BOUNCE
+    term._phase_beats[:] = 0.0
+    term._write_command()
+    ref = microduck_mdp.dance_reference(
+        term.phase_beats, term.bpm, term.move_id
+    )
+    # On-reference: trunk at STAND_Z + dz_ref. Off-reference: standing height.
+    on = microduck_mdp.dance_body_tracking(env)
+    asset.data.root_link_pos_w[:, 2] = DANCE_NOMINAL_HEIGHT + ref["dz"]
+    on_ref = microduck_mdp.dance_body_tracking(env)
+    assert torch.all(on_ref > on)
+
+    # weight_shift at quarter phase: roll reference at +amplitude.
+    term._move_id[:] = microduck_mdp.DANCE_MOVE_WEIGHT_SHIFT
+    term._phase_beats[:] = 0.5  # φ = π → sin(φ/2) = 1
+    term._write_command()
+    ref = microduck_mdp.dance_reference(
+        term.phase_beats, term.bpm, term.move_id
+    )
+    amp = microduck_mdp.DANCE_ROLL_AMPLITUDE
+    assert torch.allclose(ref["droll"], torch.full((n,), amp), atol=1e-5)
+    # roll the mock trunk onto the reference: quat for pure roll about x
+    half = float(amp) / 2.0
+    asset.data.root_link_quat_w[:, 0] = math.cos(half)
+    asset.data.root_link_quat_w[:, 1] = math.sin(half)
+    on_roll = microduck_mdp.dance_body_tracking(env)
+    asset.data.root_link_quat_w[:, 1] = 0.0
+    asset.data.root_link_quat_w[:, 0] = 1.0
+    off_roll = microduck_mdp.dance_body_tracking(env)
+    assert torch.all(on_roll > off_roll)
+
+    # joint tracking: hip_roll joints at HOME + reference delta score highest.
+    ref_hip = ref["dhip_roll"]
+    ids, names = asset.find_joints_by_actuator_names([r".*hip_roll.*"])
+    off = microduck_mdp.dance_joint_tracking(env)
+    asset.data.joint_pos[:, ids] = (
+        asset.data.default_joint_pos[:, ids] + ref_hip.unsqueeze(-1)
+    )
+    on_joint = microduck_mdp.dance_joint_tracking(env)
+    assert torch.all(on_joint > off)
+
+    # beat_sync: velocity exactly matching the reference raises the potential.
+    term._move_id[:] = microduck_mdp.DANCE_MOVE_SQUAT_BOUNCE
+    term._phase_beats[:] = 0.25  # φ = π/2 → max |vz_ref|
+    term._write_command()
+    ref = microduck_mdp.dance_reference(
+        term.phase_beats, term.bpm, term.move_id
+    )
+    env.episode_length_buf += 1  # avoid the first-step zero
+    asset.data.root_link_lin_vel_w[:, 2] = 0.0
+    microduck_mdp.dance_beat_sync(env)  # sets prev from the off-reference state
+    asset.data.root_link_lin_vel_w[:, 2] = ref["vz_ref"]
+    r_on = microduck_mdp.dance_beat_sync(env)
+    assert torch.all(r_on > 0.0)  # moving onto the reference pays Δprogress
