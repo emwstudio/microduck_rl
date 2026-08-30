@@ -7186,3 +7186,376 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# --------------------------------------------------------------------------- #
+# DANCE task — beat-conditioned dancing on flat ground                          #
+# --------------------------------------------------------------------------- #
+# The policy dances on the spot to a beat: the "body_pose" command slot (6D of
+# the shared 13D command block) is semantically RE-MAPPED to a dance command
+# (the obs layout is unchanged, so ONNX/runtime hot-swap parity holds):
+#
+#   body_pose[0] = sin(φ)          beat phase, φ = 2π·t·BPM/60
+#   body_pose[1] = cos(φ)
+#   body_pose[2] = tempo_norm      BPM / 120, BPM sampled in DANCE_BPM_RANGE
+#   body_pose[3] = one-hot move 0  squat_bounce
+#   body_pose[4] = one-hot move 1  weight_shift
+#   body_pose[5] = one-hot move 2  head_bob
+#
+# The twist(3) and head_pose(4) slots keep their original semantics with tiny
+# non-zero sampling ranges (dead-weight guard). Reference motions are analytic
+# functions of the beat phase held by DanceCommand — rewards read the phase
+# from the command TERM (unwrapped, so 2-beat moves are unambiguous), while the
+# policy only ever sees the wrapped (sin, cos) encoding.
+
+DANCE_MOVE_SQUAT_BOUNCE = 0
+DANCE_MOVE_WEIGHT_SHIFT = 1
+DANCE_MOVE_HEAD_BOB = 2
+DANCE_NUM_MOVES = 3
+
+DANCE_BPM_RANGE = (90.0, 140.0)
+# Move resample cadence: every 8–16 beats (uniform per move). Tempo and initial
+# phase are resampled per episode (DanceCommand.reset).
+DANCE_MOVE_LEN_BEATS = (8.0, 16.0)
+
+# squat_bounce: trunk z dips sinusoidally, lowest point ON the beat (φ = 0).
+# Amplitude measured against the standing equilibrium STAND_Z=0.115 (the same
+# constant the standup/ball_kick envs use — do not re-derive from the keyframe
+# FK height 0.12, which ignores contact compression).
+DANCE_SQUAT_AMPLITUDE = 0.025  # m — dip depth below nominal standing height
+# weight_shift: trunk roll ±8°, period = 2 beats (left one beat, right one
+# beat). The ankle joints are PITCH-axis on this robot (no ankle roll), so the
+# joint-space reference is carried by the hip_roll pair alone, feet stay flat.
+DANCE_ROLL_AMPLITUDE = math.radians(8.0)
+DANCE_HIP_ROLL_AMPLITUDE = math.radians(6.0)
+# head_bob: head_pitch nods at 2× the beat frequency, ±15° around HOME.
+DANCE_HEAD_BOB_AMPLITUDE = math.radians(15.0)
+
+# Key joints constrained by the joint-space reference (dance_joint_tracking).
+# hip_roll: both legs, same-sign delta (rolls the trunk). head_pitch: the bob.
+_DANCE_JOINT_PATTERNS = [r".*hip_roll.*", r".*head_pitch.*"]
+
+
+def dance_reference(
+    phase_beats: torch.Tensor,
+    bpm: torch.Tensor,
+    move_id: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Analytic per-move reference from the (unwrapped) beat phase.
+
+    Args:
+        phase_beats: (N,) beat phase in BEATS, unwrapped (φ = 2π·phase_beats).
+        bpm: (N,) tempo in beats per minute.
+        move_id: (N,) long tensor in {0, 1, 2} (see DANCE_MOVE_*).
+
+    Returns a dict of (N,) tensors — position deltas (added to HOME/STAND_Z)
+    and their time-derivatives (reference velocities for beat-sync shaping):
+        dz                 trunk z offset (≤ 0, squat_bounce)
+        vz_ref             dz/dt
+        droll              trunk roll offset (weight_shift, 2-beat period)
+        roll_rate_ref      d(droll)/dt
+        dhip_roll          hip_roll joint delta (weight_shift, both legs)
+        dhead_pitch        head_pitch joint delta (head_bob, 2× beat freq)
+        head_pitch_rate_ref d(dhead_pitch)/dt
+    All zeros for channels a move doesn't use. Pure function of its inputs —
+    deterministic and NaN-free for finite inputs (locked by tests).
+    """
+    phi = 2.0 * math.pi * phase_beats
+    omega = 2.0 * math.pi * bpm / 60.0  # beat angular rate, rad/s
+
+    is_squat = move_id == DANCE_MOVE_SQUAT_BOUNCE
+    is_shift = move_id == DANCE_MOVE_WEIGHT_SHIFT
+    is_bob = move_id == DANCE_MOVE_HEAD_BOB
+
+    zero = torch.zeros_like(phi)
+    # Squat: lowest point on the beat → dz = -A·(1+cos φ)/2 (=-A at φ=0, 0 at φ=π).
+    dz = torch.where(is_squat, -0.5 * DANCE_SQUAT_AMPLITUDE * (1.0 + torch.cos(phi)), zero)
+    vz_ref = torch.where(is_squat, 0.5 * DANCE_SQUAT_AMPLITUDE * omega * torch.sin(phi), zero)
+    # Weight shift: roll = B·sin(φ/2) — period 2 beats (one beat per side).
+    half = 0.5 * phi
+    droll = torch.where(is_shift, DANCE_ROLL_AMPLITUDE * torch.sin(half), zero)
+    roll_rate_ref = torch.where(
+        is_shift, DANCE_ROLL_AMPLITUDE * 0.5 * omega * torch.cos(half), zero
+    )
+    dhip = torch.where(is_shift, DANCE_HIP_ROLL_AMPLITUDE * torch.sin(half), zero)
+    # Head bob: head_pitch = D·sin(2φ) — 2 nods per beat.
+    dhead = torch.where(is_bob, DANCE_HEAD_BOB_AMPLITUDE * torch.sin(2.0 * phi), zero)
+    dhead_rate = torch.where(
+        is_bob, 2.0 * DANCE_HEAD_BOB_AMPLITUDE * omega * torch.cos(2.0 * phi), zero
+    )
+    return {
+        "dz": dz,
+        "vz_ref": vz_ref,
+        "droll": droll,
+        "roll_rate_ref": roll_rate_ref,
+        "dhip_roll": dhip,
+        "dhead_pitch": dhead,
+        "head_pitch_rate_ref": dhead_rate,
+    }
+
+
+class DanceCommand(CommandTerm):
+    """Beat-phase + tempo + move-id command for the dance task (6D body_pose slot).
+
+    See the section header above for the exact slot layout. Phase advances with
+    the per-env tempo every control step; tempo/initial phase resample per
+    episode (reset), move id resamples every DANCE_MOVE_LEN_BEATS beats (and at
+    reset). Time-based resampling (``resampling_time_range``) is bypassed like
+    GroundPickPhaseCommand — the beat clock is the only clock here.
+    """
+
+    cfg: "DanceCommandCfg"
+
+    def __init__(self, cfg: "DanceCommandCfg", env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._phase_beats = torch.zeros(self.num_envs, device=self.device)
+        self._bpm = torch.full((self.num_envs,), 120.0, device=self.device)
+        self._move_id = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self._beats_left = torch.zeros(self.num_envs, device=self.device)
+        self._command = torch.zeros(self.num_envs, 6, device=self.device)
+        self._write_command()
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self._command
+
+    @property
+    def phase_beats(self) -> torch.Tensor:
+        return self._phase_beats
+
+    @property
+    def bpm(self) -> torch.Tensor:
+        return self._bpm
+
+    @property
+    def move_id(self) -> torch.Tensor:
+        return self._move_id
+
+    def _write_command(self) -> None:
+        phi = 2.0 * math.pi * self._phase_beats
+        self._command[:, 0] = torch.sin(phi)
+        self._command[:, 1] = torch.cos(phi)
+        self._command[:, 2] = self._bpm / 120.0
+        one_hot = torch.zeros(self.num_envs, DANCE_NUM_MOVES, device=self.device)
+        one_hot.scatter_(1, self._move_id.unsqueeze(1), 1.0)
+        self._command[:, 3 : 3 + DANCE_NUM_MOVES] = one_hot
+
+    def _sample_move(self, env_ids: torch.Tensor) -> None:
+        """Resample the move, excluding the current one (a resample always switches)."""
+        n = len(env_ids)
+        if n == 0:
+            return
+        offset = torch.randint(1, DANCE_NUM_MOVES, (n,), device=self.device)
+        self._move_id[env_ids] = (self._move_id[env_ids] + offset) % DANCE_NUM_MOVES
+        lo, hi = self.cfg.move_len_beats
+        self._beats_left[env_ids] = torch.empty(n, device=self.device).uniform_(lo, hi)
+
+    def reset(self, env_ids: torch.Tensor | None) -> dict:
+        if env_ids is not None and len(env_ids) > 0:
+            n = len(env_ids)
+            lo, hi = self.cfg.bpm_range
+            self._bpm[env_ids] = torch.empty(n, device=self.device).uniform_(lo, hi)
+            # Random initial phase decorrelates envs (per the task design).
+            self._phase_beats[env_ids] = torch.rand(n, device=self.device)
+            self._move_id[env_ids] = torch.randint(
+                0, DANCE_NUM_MOVES, (n,), device=self.device
+            )
+            self._sample_move(env_ids)  # fresh move-length countdown
+            self._write_command()
+        return {}
+
+    def compute(self, dt: float) -> None:
+        dbeats = dt * self._bpm / 60.0
+        self._phase_beats += dbeats
+        self._beats_left -= dbeats
+        resample_ids = (self._beats_left <= 0.0).nonzero().flatten()
+        if len(resample_ids) > 0:
+            self._sample_move(resample_ids)
+        self._write_command()
+
+    def _update_metrics(self) -> None:
+        pass
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        pass  # Sampling happens in reset()/compute() — beat clock, not wall clock.
+
+    def _update_command(self) -> None:
+        pass  # Updated in compute().
+
+
+@_dataclass(kw_only=True)
+class DanceCommandCfg(CommandTermCfg):
+    """Builds a DanceCommand. Time-based resampling is unused (beat-driven)."""
+
+    bpm_range: tuple[float, float] = DANCE_BPM_RANGE
+    move_len_beats: tuple[float, float] = DANCE_MOVE_LEN_BEATS
+    resampling_time_range: tuple[float, float] = (1.0e6, 1.0e6)  # bypassed
+
+    def build(self, env: ManagerBasedRlEnv) -> "DanceCommand":
+        return DanceCommand(self, env)
+
+
+def _dance_reference_from_command(env: ManagerBasedRlEnv, command_name: str):
+    """Current dance reference for each env, from the DanceCommand term state."""
+    term = env.command_manager.get_term(command_name)
+    assert isinstance(term, DanceCommand), (
+        f"Command '{command_name}' is a {type(term).__name__}, expected DanceCommand — "
+        "the dance rewards require the dance command mapping."
+    )
+    return dance_reference(term.phase_beats, term.bpm, term.move_id)
+
+
+def dance_body_tracking(
+    env: ManagerBasedRlEnv,
+    command_name: str = "body_pose",
+    nominal_height: float = 0.115,  # STAND_Z — measured standing trunk z
+    z_std: float = 0.015,
+    angle_std: float = math.radians(10),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Mean of 3 Gaussians: trunk z / roll / pitch vs the dance reference.
+
+    z and roll track the move's analytic reference (dz, droll); pitch targets 0.
+    For moves that don't oscillate a channel the reference there is 0, so the
+    term doubles as a "stay at standing height / level" objective. stds follow
+    the AGENTS.md rule (≈ the error worth pricing): 1.5 cm in z (bounce
+    amplitude is 2.5 cm), 10° in angle (roll amplitude is 8°).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    ref = _dance_reference_from_command(env, command_name)
+
+    pos_w = asset.data.root_link_pos_w
+    origin = env.scene.terrain.env_origins
+    z = torch.nan_to_num(pos_w[:, 2] - origin[:, 2], nan=0.0)
+    z_err = z - (nominal_height + ref["dz"])
+
+    quat = asset.data.root_link_quat_w
+    qw, qx, qy, qz = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    roll = torch.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy))
+    pitch = torch.asin(torch.clamp(2.0 * (qw * qy - qz * qx), -1.0, 1.0))
+    roll_err = roll - ref["droll"]
+
+    r_z = torch.exp(-(z_err / z_std) ** 2)
+    r_r = torch.exp(-(roll_err / angle_std) ** 2)
+    r_p = torch.exp(-(pitch / angle_std) ** 2)
+    return (r_z + r_r + r_p) / 3.0
+
+
+def dance_joint_tracking(
+    env: ManagerBasedRlEnv,
+    command_name: str = "body_pose",
+    std: float = 0.15,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Per-joint Gaussian tracking of the joint-space dance reference (key joints only).
+
+    Constrains hip_roll (weight_shift) and head_pitch (head_bob); every other
+    joint is left to the pose regularizer. Measured THROUGH the backlash like
+    head_pose_tracking (qpos[servo] + qpos[backlash]) — on plain models the
+    backlash mask is 0 and this reduces to the servo position.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    ref = _dance_reference_from_command(env, command_name)
+
+    if not hasattr(env, "_dance_joint_ids"):
+        ids, names = asset.find_joints_by_actuator_names(_DANCE_JOINT_PATTERNS)
+        env._dance_joint_ids = torch.tensor(ids, device=env.device, dtype=torch.long)
+        name_to_id = {n: i for i, n in enumerate(asset.joint_names)}
+        bl = [name_to_id.get(f"passive_{n}_backlash") for n in names]
+        env._dance_joint_bl_ids = torch.tensor(
+            [0 if b is None else b for b in bl], device=env.device, dtype=torch.long
+        )
+        env._dance_joint_bl_mask = torch.tensor(
+            [0.0 if b is None else 1.0 for b in bl], device=env.device
+        )
+        # Reference channel per joint: 0 = hip_roll delta, 1 = head_pitch delta.
+        env._dance_joint_channel = torch.tensor(
+            [0 if "hip_roll" in n else 1 for n in names],
+            device=env.device,
+            dtype=torch.long,
+        )
+
+    joint_pos = asset.data.joint_pos
+    measured = (
+        joint_pos[:, env._dance_joint_ids]
+        + joint_pos[:, env._dance_joint_bl_ids] * env._dance_joint_bl_mask
+    )
+    actual = measured - asset.data.default_joint_pos[:, env._dance_joint_ids]
+    deltas = torch.stack([ref["dhip_roll"], ref["dhead_pitch"]], dim=1)  # (N, 2)
+    target = deltas[:, env._dance_joint_channel]
+    per_joint = torch.exp(-((actual - target) / std) ** 2)
+    return per_joint.mean(dim=-1)
+
+
+def dance_beat_sync(
+    env: ManagerBasedRlEnv,
+    command_name: str = "body_pose",
+    gamma: float = 0.99,
+    z_vel_std: float = 0.10,
+    roll_rate_std: float = 0.5,
+    head_rate_std: float = 3.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Potential-based beat-synchrony shaping: pays Δ-alignment, unfarmable.
+
+    Per move, one oscillating channel is compared to the reference VELOCITY
+    (extrema land on beat points when velocity tracks):
+      squat_bounce → trunk vertical velocity vs dz/dt
+      weight_shift → trunk roll rate vs d(droll)/dt
+      head_bob     → head_pitch joint velocity vs d(dhead)/dt
+
+    Potential Φ = exp(-(err/std)²); the reward is γ·Φ_t − Φ_{t−1} (γ = 0.99),
+    so improving alignment pays, HOLDING alignment pays ~zero, and there is no
+    per-step jackpot to farm (classic potential-based shaping). The first step
+    of an episode pays exactly 0 (prev reset to current).
+
+    Not a self-negating penalty (the value oscillates around 0) — use a
+    POSITIVE weight. Per-step magnitude is bounded in [−1, 1].
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    term = env.command_manager.get_term(command_name)
+    ref = dance_reference(term.phase_beats, term.bpm, term.move_id)
+    move_id = term.move_id
+
+    vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
+    roll_rate = torch.nan_to_num(asset.data.root_link_ang_vel_w[:, 3], nan=0.0)
+
+    # head_pitch joint velocity, measured through the backlash like
+    # dance_joint_tracking (servo + passive play).
+    if not hasattr(env, "_dance_head_vel_ids"):
+        ids, names = asset.find_joints_by_actuator_names([r".*head_pitch.*"])
+        env._dance_head_vel_ids = torch.tensor(ids, device=env.device, dtype=torch.long)
+        name_to_id = {n: i for i, n in enumerate(asset.joint_names)}
+        bl = [name_to_id.get(f"passive_{n}_backlash") for n in names]
+        env._dance_head_vel_bl_ids = torch.tensor(
+            [0 if b is None else b for b in bl], device=env.device, dtype=torch.long
+        )
+        env._dance_head_vel_bl_mask = torch.tensor(
+            [0.0 if b is None else 1.0 for b in bl], device=env.device
+        )
+    joint_vel = asset.data.joint_vel
+    head_rate = (
+        joint_vel[:, env._dance_head_vel_ids]
+        + joint_vel[:, env._dance_head_vel_bl_ids] * env._dance_head_vel_bl_mask
+    ).squeeze(-1)
+
+    err_squat = (vz - ref["vz_ref"]) / z_vel_std
+    err_shift = (roll_rate - ref["roll_rate_ref"]) / roll_rate_std
+    err_bob = (head_rate - ref["head_pitch_rate_ref"]) / head_rate_std
+    err = torch.where(
+        move_id == DANCE_MOVE_SQUAT_BOUNCE,
+        err_squat,
+        torch.where(move_id == DANCE_MOVE_WEIGHT_SHIFT, err_shift, err_bob),
+    )
+    potential = torch.exp(-(err**2))
+
+    prev = getattr(env, "_dance_beat_sync_prev", None)
+    if prev is None:
+        prev = potential
+    # First step after a reset: no Δ to pay (prev := current → reward 0).
+    first_step = env.episode_length_buf == 0
+    prev = torch.where(first_step, potential, prev)
+
+    reward = gamma * potential - prev
+    env._dance_beat_sync_prev = potential.detach()
+    return reward
