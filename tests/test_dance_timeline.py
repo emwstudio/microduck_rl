@@ -55,15 +55,15 @@ def test_load_timeline_rejects_missing_keys(tmp_path):
 
 
 def test_load_timeline_rejects_untrained_moves(tmp_path):
-    # timeline.py can emit step_touch(3)/spin(4); the trained policy knows 0-2.
+    # The trained policy knows moves 0-4; anything beyond is rejected.
     bad = tmp_path / "bad_move.json"
     bad.write_text(json.dumps({
         "bpm": 120.0, "t0": 0.0, "duration": 10.0,
         "beat_times": [0.0, 0.5, 1.0],
-        "segments": [{"move": 3, "move_name": "step_touch",
+        "segments": [{"move": 5, "move_name": "unknown",
                       "start_beat": 0, "end_beat": 1, "t_start": 0.0, "t_end": 1.0}],
     }))
-    with pytest.raises(ValueError, match="move 3"):
+    with pytest.raises(ValueError, match="move 5"):
         d2t.load_timeline(bad)
 
 
@@ -173,8 +173,7 @@ def test_dance_command_layout_and_ranges():
         assert cmd[0] ** 2 + cmd[1] ** 2 == pytest.approx(1.0, abs=1e-5)
         # tempo_norm = bpm/120
         assert cmd[2] == pytest.approx(tl["bpm"] / 120.0, abs=1e-6)
-        # exactly one move slot is 1
-        assert cmd[3:6].sum() == pytest.approx(1.0)
+        # 3-bit move id in slots 3-5
         assert set(np.round(cmd[3:6], 6).tolist()) <= {0.0, 1.0}
 
 

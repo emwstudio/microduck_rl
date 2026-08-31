@@ -70,8 +70,8 @@ DEFAULT_POSE = np.array([
     -0.4530,  # right_ankle
 ], dtype=np.float32)
 
-MOVE_NAMES = {0: "squat_bounce", 1: "weight_shift", 2: "head_bob"}
-NUM_MOVES = 3  # the trained policy knows moves 0-2 only
+MOVE_NAMES = {0: "squat_bounce", 1: "weight_shift", 2: "head_bob", 3: "climax", 4: "call_out"}
+NUM_MOVES = 5  # the trained policy knows moves 0-4 only
 
 # Physics / control (match training — see module docstring)
 SIM_TIMESTEP = 0.005
@@ -109,7 +109,7 @@ def load_timeline(path):
             raise ValueError(
                 f"segment uses move {seg['move']} ({seg.get('move_name', '?')}) — "
                 f"the trained dance policy only knows moves 0-{NUM_MOVES - 1} "
-                f"({sorted(MOVE_NAMES)}); regenerate the timeline with --moves 0,1,2"
+                f"({sorted(MOVE_NAMES)}); regenerate the timeline with moves 0-{NUM_MOVES - 1}"
             )
     data["segments"] = segments
     return data
@@ -154,7 +154,9 @@ def dance_command(t, timeline):
     cmd[0] = math.sin(phi_half)
     cmd[1] = math.cos(phi_half)
     cmd[2] = timeline["bpm"] / 120.0
-    cmd[3 + move] = 1.0
+    cmd[3] = float(move & 1)         # 3-bit move id（与训练侧一致）
+    cmd[4] = float((move >> 1) & 1)
+    cmd[5] = float((move >> 2) & 1)
     return cmd
 
 

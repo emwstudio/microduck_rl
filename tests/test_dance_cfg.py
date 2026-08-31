@@ -122,7 +122,7 @@ def test_walking_semantic_curricula_removed():
     stages = cfg.curriculum["action_rate_weight"].params["weight_stages"]
     weights = [s["weight"] for s in stages]
     assert weights == sorted(weights, reverse=True)  # ramps more negative
-    assert weights[-1] == -0.6
+    assert weights[-1] == -0.3  # DJ 级大动作需要动作税空间
 
 
 def test_symmetry_augmentation_is_disabled():
@@ -159,7 +159,7 @@ def test_squat_bounce_lowest_point_on_the_beat():
     dz = _ref(microduck_mdp.DANCE_MOVE_SQUAT_BOUNCE, phase)["dz"]
     # lowest at integer beats (φ = 0 mod 2π), standing height at half beats
     amp = microduck_mdp.DANCE_SQUAT_AMPLITUDE
-    assert 0.02 <= amp <= 0.03  # design: 2–3 cm
+    assert 0.03 <= amp <= 0.05  # design: ~3.8 cm（v7 DJ 级）
     assert torch.isclose(dz[0], torch.tensor(-amp), atol=1e-6)
     assert dz.min() >= -amp - 1e-6 and dz.max() <= 1e-6
     at_half_beat = _ref(
@@ -188,10 +188,10 @@ def test_head_bob_is_double_beat_frequency():
     phase = torch.linspace(0.0, 1.0, 1001)
     dhead = _ref(microduck_mdp.DANCE_MOVE_HEAD_BOB, phase)["dhead_pitch"]
     amp = microduck_mdp.DANCE_HEAD_BOB_AMPLITUDE
-    # D·sin(2φ): two full nods per beat, bounded by ±15°
+    # D·sin(2φ): two full nods per beat, bounded by ±25°（v7 DJ 级）
     expected = amp * torch.sin(2.0 * (2.0 * math.pi * phase))
     assert torch.allclose(dhead, expected, atol=1e-5)
-    assert amp <= math.radians(15.0) + 1e-9
+    assert amp <= math.radians(25.0) + 1e-9
 
 
 def test_reference_is_zero_outside_its_move():
@@ -233,9 +233,12 @@ def test_dance_command_slots_carry_valid_values():
     # tempo_norm = BPM/120 within the sampled range
     lo, hi = microduck_mdp.DANCE_BPM_RANGE
     assert (c[:, 2] >= lo / 120.0).all() and (c[:, 2] <= hi / 120.0).all()
-    # move one-hot: exactly one of the last three slots is 1
-    assert torch.allclose(c[:, 3:6].sum(dim=1), torch.ones(8))
-    assert set(cmd.move_id.tolist()) <= {0, 1, 2}
+    # move id 3-bit binary in slots 3-5 (0-4 in use, 5-7 reserved)
+    assert set(c[:, 3].tolist()) <= {0.0, 1.0} and set(c[:, 4].tolist()) <= {0.0, 1.0}
+    assert set(c[:, 5].tolist()) <= {0.0, 1.0}
+    decoded = c[:, 3].long() + 2 * c[:, 4].long() + 4 * c[:, 5].long()
+    assert torch.equal(decoded, cmd.move_id)
+    assert set(cmd.move_id.tolist()) <= {0, 1, 2, 3, 4}
 
 
 def test_dance_command_phase_advances_with_tempo():
@@ -260,8 +263,8 @@ def test_dance_command_move_switches_and_never_repeats():
         cmd.compute(0.02)
         changed = cmd.move_id != prev
         assert torch.all(cmd.move_id[changed] != prev[changed])
-    one_hot_sum = cmd.command[:, 3:6].sum(dim=1)
-    assert torch.allclose(one_hot_sum, torch.ones(8))
+    decoded = cmd.command[:, 3].long() + 2 * cmd.command[:, 4].long() + 4 * cmd.command[:, 5].long()
+    assert torch.equal(decoded, cmd.move_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -296,8 +299,10 @@ def test_dance_joint_patterns_resolve_on_walk_model():
         for j in actuated
         if any(re.fullmatch(p, j) for p in microduck_mdp._DANCE_JOINT_PATTERNS)
     ]
-    # exactly the hip_roll pair + head_pitch, all actuated servo joints
-    assert sorted(matched) == ["head_pitch", "left_hip_roll", "right_hip_roll"]
+    # hip_roll pair + head_pitch/head_yaw/head_roll, all actuated servo joints
+    assert sorted(matched) == [
+        "head_pitch", "head_roll", "head_yaw", "left_hip_roll", "right_hip_roll"
+    ]
 
 
 def test_dance_joint_patterns_resolve_on_backlash_model():
@@ -313,7 +318,9 @@ def test_dance_joint_patterns_resolve_on_backlash_model():
         if any(re.fullmatch(p, j) for p in microduck_mdp._DANCE_JOINT_PATTERNS)
     ]
     # backlash hinges are passive_* and must NOT be matched as actuated targets
-    assert sorted(matched) == ["head_pitch", "left_hip_roll", "right_hip_roll"]
+    assert sorted(matched) == [
+        "head_pitch", "head_roll", "head_yaw", "left_hip_roll", "right_hip_roll"
+    ]
     # ... but each matched joint must HAVE a passive_*_backlash companion so the
     # through-backlash measurement in dance_joint_tracking finds it
     for name in matched:

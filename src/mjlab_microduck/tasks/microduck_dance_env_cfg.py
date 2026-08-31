@@ -1,7 +1,8 @@
 """Microduck DANCE task — beat-conditioned dancing on flat ground.
 
 The policy dances on the spot to a sampled beat: a DanceCommand term drives the
-6D "body_pose" command slot with [sin φ, cos φ, tempo_norm, move one-hot(3)]
+6D "body_pose" command slot with [sin(φ/2), cos(φ/2), tempo_norm, move 2-bit id]
+(0 squat_bounce / 1 weight_shift / 2 head_bob / 3 climax)
 (see the DANCE section header in mdp.py for the exact mapping — the 13D command
 block layout [twist(3), head_pose(4), body_pose(6)] is UNCHANGED, so the 61D
 obs contract and runtime policy hot-swap still hold).
@@ -125,7 +126,7 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards["pose"].params["std_running"] = DANCE_STD_POSE
 
     # Head pose slot: alive, near-neutral; the bob reference out-weighs it.
-    cfg.rewards["head_pose_tracking"].weight = 0.3
+    cfg.rewards["head_pose_tracking"].weight = 0.1
 
     # The base's body_pose_tracking_6d infra reads the body_pose slot as 6D pose
     # deltas — wrong semantics here (the slot is a dance command). Removed.
@@ -150,7 +151,7 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # Beat synchrony: potential-based Δ-alignment shaping (unfarmable).
     cfg.rewards["dance_beat_sync"] = RewardTermCfg(
         func=microduck_mdp.dance_beat_sync,
-        weight=1.0,
+        weight=1.5,
         params={"command_name": "body_pose"},
     )
     # Feet planted (self-negating cost ≥ 0 → negative weight).
@@ -172,10 +173,10 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # Smoothness ramps gently and caps at -0.6 (vs -1.0 for walking): rhythmic
     # 1.5–2.3 Hz motion must stay affordable.
     cfg.curriculum["action_rate_weight"].params["weight_stages"] = [
-        {"step": 0, "weight": -0.1},
-        {"step": 500 * NUM_STEPS_PER_ENV, "weight": -0.2},
-        {"step": 1000 * NUM_STEPS_PER_ENV, "weight": -0.4},
-        {"step": 1500 * NUM_STEPS_PER_ENV, "weight": -0.6},
+        {"step": 0, "weight": -0.05},
+        {"step": 500 * NUM_STEPS_PER_ENV, "weight": -0.1},
+        {"step": 1000 * NUM_STEPS_PER_ENV, "weight": -0.2},
+        {"step": 1500 * NUM_STEPS_PER_ENV, "weight": -0.3},
     ]
     # Kept as inherited: com_range, head_com_range, head_pose_bias_weight.
     # head_pose_bias measures the error vs the ~neutral head_pose command; its

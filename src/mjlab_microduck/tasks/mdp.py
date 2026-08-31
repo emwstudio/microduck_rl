@@ -7198,9 +7198,9 @@ def roulade_lateral_velocity_penalty(
 #   body_pose[0] = sin(φ/2)        beat phase over a 2-BEAT cycle, φ = 2π·t·BPM/60
 #   body_pose[1] = cos(φ/2)        (2-beat wrap: odd/even beats distinguishable)
 #   body_pose[2] = tempo_norm      BPM / 120, BPM sampled in DANCE_BPM_RANGE
-#   body_pose[3] = one-hot move 0  squat_bounce
-#   body_pose[4] = one-hot move 1  weight_shift
-#   body_pose[5] = one-hot move 2  head_bob
+#   body_pose[3] = move id bit 0   3-bit move id: 0 squat_bounce, 1 weight_shift,
+#   body_pose[4] = move id bit 1   2 head_bob, 3 climax（深蹲+摆胯+点头锤+甩头），
+#   body_pose[5] = move id bit 2   4 call_out（头抬高呼喊）；5-7 预留
 #
 # The twist(3) and head_pose(4) slots keep their original semantics with tiny
 # non-zero sampling ranges (dead-weight guard). Reference motions are analytic
@@ -7213,7 +7213,9 @@ def roulade_lateral_velocity_penalty(
 DANCE_MOVE_SQUAT_BOUNCE = 0
 DANCE_MOVE_WEIGHT_SHIFT = 1
 DANCE_MOVE_HEAD_BOB = 2
-DANCE_NUM_MOVES = 3
+DANCE_MOVE_CLIMAX = 3
+DANCE_MOVE_CALL_OUT = 4
+DANCE_NUM_MOVES = 5
 
 DANCE_BPM_RANGE = (90.0, 140.0)
 # Move resample cadence: every 8–16 beats (uniform per move). Tempo and initial
@@ -7224,18 +7226,28 @@ DANCE_MOVE_LEN_BEATS = (8.0, 16.0)
 # Amplitude measured against the standing equilibrium STAND_Z=0.115 (the same
 # constant the standup/ball_kick envs use — do not re-derive from the keyframe
 # FK height 0.12, which ignores contact compression).
-DANCE_SQUAT_AMPLITUDE = 0.025  # m — dip depth below nominal standing height
+DANCE_SQUAT_AMPLITUDE = 0.038  # m — dip depth below nominal standing height
 # weight_shift: trunk roll ±8°, period = 2 beats (left one beat, right one
 # beat). The ankle joints are PITCH-axis on this robot (no ankle roll), so the
 # joint-space reference is carried by the hip_roll pair alone, feet stay flat.
-DANCE_ROLL_AMPLITUDE = math.radians(8.0)
-DANCE_HIP_ROLL_AMPLITUDE = math.radians(6.0)
-# head_bob: head_pitch nods at 2× the beat frequency, ±15° around HOME.
-DANCE_HEAD_BOB_AMPLITUDE = math.radians(15.0)
+DANCE_ROLL_AMPLITUDE = math.radians(13.0)
+DANCE_HIP_ROLL_AMPLITUDE = math.radians(11.0)
+# head_bob: head_pitch nods at 2× the beat frequency, ±25° around HOME.
+DANCE_HEAD_BOB_AMPLITUDE = math.radians(25.0)
+# climax（歌曲高潮专用 combo）：深蹲 + 大摆胯 + 点头 + 甩头同时上，全面夸张。
+# 同一个 move id 驱动所有重复高潮段 → 每次高潮动作一致。
+DANCE_CLIMAX_SQUAT = 0.045  # m
+DANCE_CLIMAX_ROLL = math.radians(16.0)
+DANCE_CLIMAX_HIP_ROLL = math.radians(13.0)
+DANCE_CLIMAX_HEAD_BOB = math.radians(28.0)
+DANCE_CLIMAX_HEAD_YAW = math.radians(25.0)
+# call_out（长音呼喊）：头持续抬高（喙朝天 = 张嘴高歌感），缓慢侧摇。
+DANCE_CALL_OUT_PITCH = math.radians(15.0)
+DANCE_CALL_OUT_ROLL = math.radians(5.0)
 
 # Key joints constrained by the joint-space reference (dance_joint_tracking).
 # hip_roll: both legs, same-sign delta (rolls the trunk). head_pitch: the bob.
-_DANCE_JOINT_PATTERNS = [r".*hip_roll.*", r".*head_pitch.*"]
+_DANCE_JOINT_PATTERNS = [r".*hip_roll.*", r".*head_pitch.*", r".*head_yaw.*", r".*head_roll.*"]
 
 
 def dance_reference(
@@ -7268,22 +7280,46 @@ def dance_reference(
     is_squat = move_id == DANCE_MOVE_SQUAT_BOUNCE
     is_shift = move_id == DANCE_MOVE_WEIGHT_SHIFT
     is_bob = move_id == DANCE_MOVE_HEAD_BOB
+    is_climax = move_id == DANCE_MOVE_CLIMAX
 
     zero = torch.zeros_like(phi)
-    # Squat: lowest point on the beat → dz = -A·(1+cos φ)/2 (=-A at φ=0, 0 at φ=π).
-    dz = torch.where(is_squat, -0.5 * DANCE_SQUAT_AMPLITUDE * (1.0 + torch.cos(phi)), zero)
-    vz_ref = torch.where(is_squat, 0.5 * DANCE_SQUAT_AMPLITUDE * omega * torch.sin(phi), zero)
-    # Weight shift: roll = B·sin(φ/2) — period 2 beats (one beat per side).
     half = 0.5 * phi
-    droll = torch.where(is_shift, DANCE_ROLL_AMPLITUDE * torch.sin(half), zero)
-    roll_rate_ref = torch.where(
-        is_shift, DANCE_ROLL_AMPLITUDE * 0.5 * omega * torch.cos(half), zero
-    )
-    dhip = torch.where(is_shift, DANCE_HIP_ROLL_AMPLITUDE * torch.sin(half), zero)
+    # Squat: lowest point on the beat → dz = -A·(1+cos φ)/2 (=-A at φ=0, 0 at φ=π).
+    # climax 用更深的同一波形。
+    for_squat = is_squat | is_climax
+    amp_z = torch.where(is_climax, DANCE_CLIMAX_SQUAT, DANCE_SQUAT_AMPLITUDE)
+    dz = torch.where(for_squat, -0.5 * amp_z * (1.0 + torch.cos(phi)), zero)
+    vz_ref = torch.where(for_squat, 0.5 * amp_z * omega * torch.sin(phi), zero)
+    # Weight shift: roll = B·sin(φ/2) — period 2 beats (one beat per side).
+    # climax 摆更大的同一波形。
+    for_shift = is_shift | is_climax
+    amp_r = torch.where(is_climax, DANCE_CLIMAX_ROLL, DANCE_ROLL_AMPLITUDE)
+    amp_h = torch.where(is_climax, DANCE_CLIMAX_HIP_ROLL, DANCE_HIP_ROLL_AMPLITUDE)
+    droll = torch.where(for_shift, amp_r * torch.sin(half), zero)
+    roll_rate_ref = torch.where(for_shift, amp_r * 0.5 * omega * torch.cos(half), zero)
+    dhip = torch.where(for_shift, amp_h * torch.sin(half), zero)
     # Head bob: head_pitch = D·sin(2φ) — 2 nods per beat.
-    dhead = torch.where(is_bob, DANCE_HEAD_BOB_AMPLITUDE * torch.sin(2.0 * phi), zero)
+    # climax 改为点头锤：-A·cos(φ)，拍间抬头（φ=π 最高）、正拍猛砸（φ=0 最低）——
+    # 每个正拍必砸中，歌曲 hook（如"牛来"）落在拍点上时必然配合到。
+    is_call = move_id == DANCE_MOVE_CALL_OUT
+    dhead_bob = DANCE_HEAD_BOB_AMPLITUDE * torch.sin(2.0 * phi)
+    dhead_climax = -DANCE_CLIMAX_HEAD_BOB * torch.cos(phi)
+    dhead = torch.where(
+        is_bob,
+        dhead_bob,
+        torch.where(is_climax, dhead_climax, torch.where(is_call, DANCE_CALL_OUT_PITCH + 0 * phi, zero)),
+    )
+    dhead_rate_bob = DANCE_HEAD_BOB_AMPLITUDE * 2.0 * omega * torch.cos(2.0 * phi)
+    dhead_rate_climax = DANCE_CLIMAX_HEAD_BOB * omega * torch.sin(phi)
     dhead_rate = torch.where(
-        is_bob, 2.0 * DANCE_HEAD_BOB_AMPLITUDE * omega * torch.cos(2.0 * phi), zero
+        is_bob, dhead_rate_bob, torch.where(is_climax, dhead_rate_climax, zero)
+    )
+    # 甩头（仅 climax）：head_yaw 以 2× 节拍频率左右甩。
+    dhead_yaw = torch.where(is_climax, DANCE_CLIMAX_HEAD_YAW * torch.sin(2.0 * phi), zero)
+    # 头部反向侧倾（weight_shift / climax）：经典舞姿，头相对躯干半幅反相。
+    # droll 在非摇摆舞步下本就为 0，无需再掩码。call_out 附加缓慢侧摇。
+    dhead_roll = -0.5 * droll + torch.where(
+        is_call, DANCE_CALL_OUT_ROLL * torch.sin(half), zero
     )
     return {
         "dz": dz,
@@ -7293,6 +7329,8 @@ def dance_reference(
         "dhip_roll": dhip,
         "dhead_pitch": dhead,
         "head_pitch_rate_ref": dhead_rate,
+        "dhead_yaw": dhead_yaw,
+        "dhead_roll": dhead_roll,
     }
 
 
@@ -7341,9 +7379,10 @@ class DanceCommand(CommandTerm):
         self._command[:, 0] = torch.sin(phi_half)
         self._command[:, 1] = torch.cos(phi_half)
         self._command[:, 2] = self._bpm / 120.0
-        one_hot = torch.zeros(self.num_envs, DANCE_NUM_MOVES, device=self.device)
-        one_hot.scatter_(1, self._move_id.unsqueeze(1), 1.0)
-        self._command[:, 3 : 3 + DANCE_NUM_MOVES] = one_hot
+        # 3-bit binary move id (0-7, currently 5 moves) in slots 3-5.
+        self._command[:, 3] = (self._move_id & 1).float()
+        self._command[:, 4] = ((self._move_id >> 1) & 1).float()
+        self._command[:, 5] = ((self._move_id >> 2) & 1).float()
 
     def _sample_move(self, env_ids: torch.Tensor) -> None:
         """Resample the move, excluding the current one (a resample always switches)."""
@@ -7400,6 +7439,24 @@ class DanceCommandCfg(CommandTermCfg):
         return DanceCommand(self, env)
 
 
+import os as _os
+
+_DANCE_AMP_RAMP_STEPS = float(_os.environ.get("DANCE_AMP_RAMP_STEPS", "96000"))  # 默认 4000 iters×24
+_DANCE_AMP_START = 0.35
+
+
+def _dance_amp_scale(env: ManagerBasedRlEnv) -> float:
+    """Reference-amplitude curriculum: 35% → 100% linear over DANCE_AMP_RAMP_STEPS.
+
+    RL 早期要满幅参考=梯度悬崖（站着和跳一半都是 ~0 分），先给可达的小幅度，
+    随技能成型爬到满幅（AGENTS.md slew-target 原则）。快速验证跑（1000 iters）
+    用 DANCE_AMP_RAMP_STEPS=24000 使满幅在当次训练内到达。
+    """
+    # getattr fallback: mock envs in unit tests have no step counter → full scale.
+    t = min(1.0, getattr(env, "common_step_counter", _DANCE_AMP_RAMP_STEPS) / _DANCE_AMP_RAMP_STEPS)
+    return _DANCE_AMP_START + (1.0 - _DANCE_AMP_START) * t
+
+
 def _dance_reference_from_command(env: ManagerBasedRlEnv, command_name: str):
     """Current dance reference for each env, from the DanceCommand term state."""
     term = env.command_manager.get_term(command_name)
@@ -7407,7 +7464,11 @@ def _dance_reference_from_command(env: ManagerBasedRlEnv, command_name: str):
         f"Command '{command_name}' is a {type(term).__name__}, expected DanceCommand — "
         "the dance rewards require the dance command mapping."
     )
-    return dance_reference(term.phase_beats, term.bpm, term.move_id)
+    ref = dance_reference(term.phase_beats, term.bpm, term.move_id)
+    scale = _dance_amp_scale(env)
+    if scale < 1.0:
+        ref = {k: v * scale for k, v in ref.items()}
+    return ref
 
 
 def dance_body_tracking(
@@ -7477,9 +7538,13 @@ def dance_joint_tracking(
         env._dance_joint_bl_mask = torch.tensor(
             [0.0 if b is None else 1.0 for b in bl], device=env.device
         )
-        # Reference channel per joint: 0 = hip_roll delta, 1 = head_pitch delta.
+        # Reference channel per joint: 0 hip_roll / 1 head_pitch / 2 head_yaw /
+        # 3 head_roll (order matches _DANCE_JOINT_PATTERNS and the deltas stack).
         env._dance_joint_channel = torch.tensor(
-            [0 if "hip_roll" in n else 1 for n in names],
+            [
+                0 if "hip_roll" in n else 1 if "head_pitch" in n else 2 if "head_yaw" in n else 3
+                for n in names
+            ],
             device=env.device,
             dtype=torch.long,
         )
@@ -7490,7 +7555,9 @@ def dance_joint_tracking(
         + joint_pos[:, env._dance_joint_bl_ids] * env._dance_joint_bl_mask
     )
     actual = measured - asset.data.default_joint_pos[:, env._dance_joint_ids]
-    deltas = torch.stack([ref["dhip_roll"], ref["dhead_pitch"]], dim=1)  # (N, 2)
+    deltas = torch.stack(
+        [ref["dhip_roll"], ref["dhead_pitch"], ref["dhead_yaw"], ref["dhead_roll"]], dim=1
+    )  # (N, 4)
     target = deltas[:, env._dance_joint_channel]
     per_joint = torch.exp(-((actual - target) / std) ** 2)
     return per_joint.mean(dim=-1)
@@ -7512,6 +7579,7 @@ def dance_beat_sync(
       squat_bounce → trunk vertical velocity vs dz/dt
       weight_shift → trunk roll rate vs d(droll)/dt
       head_bob     → head_pitch joint velocity vs d(dhead)/dt
+      climax       → trunk vertical velocity (深蹲是 combo 的主通道)
 
     Potential Φ = exp(-(err/std)²); the reward is γ·Φ_t − Φ_{t−1} (γ = 0.99),
     so improving alignment pays, HOLDING alignment pays ~zero, and there is no
@@ -7554,7 +7622,7 @@ def dance_beat_sync(
     err_shift = (roll_rate - ref["roll_rate_ref"]) / roll_rate_std
     err_bob = (head_rate - ref["head_pitch_rate_ref"]) / head_rate_std
     err = torch.where(
-        move_id == DANCE_MOVE_SQUAT_BOUNCE,
+        (move_id == DANCE_MOVE_SQUAT_BOUNCE) | (move_id == DANCE_MOVE_CLIMAX),
         err_squat,
         torch.where(move_id == DANCE_MOVE_WEIGHT_SHIFT, err_shift, err_bob),
     )
