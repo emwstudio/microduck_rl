@@ -7418,7 +7418,7 @@ def dance_body_tracking(
     angle_std: float = math.radians(10),
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Mean of 3 Gaussians: trunk z / roll / pitch vs the dance reference.
+    """Product of 3 Gaussians: trunk z / roll / pitch vs the dance reference.
 
     z and roll track the move's analytic reference (dz, droll); pitch targets 0.
     For moves that don't oscillate a channel the reference there is 0, so the
@@ -7440,10 +7440,14 @@ def dance_body_tracking(
     pitch = torch.asin(torch.clamp(2.0 * (qw * qy - qz * qx), -1.0, 1.0))
     roll_err = roll - ref["droll"]
 
+    # PRODUCT of per-channel Gaussians, not the mean: an additive stack has a
+    # compromise basin (a motionless policy still scores (1+0.53+1)/3 = 0.84 on
+    # weight_shift), the product collapses on any single deficient channel
+    # (AGENTS.md). This is what actually drives amplitude to the reference.
     r_z = torch.exp(-(z_err / z_std) ** 2)
     r_r = torch.exp(-(roll_err / angle_std) ** 2)
     r_p = torch.exp(-(pitch / angle_std) ** 2)
-    return (r_z + r_r + r_p) / 3.0
+    return r_z * r_r * r_p
 
 
 def dance_joint_tracking(
@@ -7497,7 +7501,7 @@ def dance_beat_sync(
     command_name: str = "body_pose",
     gamma: float = 0.99,
     z_vel_std: float = 0.10,
-    roll_rate_std: float = 0.5,
+    roll_rate_std: float = 0.8,
     head_rate_std: float = 3.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:

@@ -138,14 +138,14 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         params={
             "command_name": "body_pose",
             "nominal_height": DANCE_NOMINAL_HEIGHT,
-            "z_std": 0.015,
-            "angle_std": math.radians(10),
+            "z_std": 0.010,
+            "angle_std": math.radians(6),
         },
     )
     cfg.rewards["dance_joint_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_joint_tracking,
         weight=1.0,
-        params={"command_name": "body_pose", "std": 0.15},
+        params={"command_name": "body_pose", "std": 0.10},
     )
     # Beat synchrony: potential-based Δ-alignment shaping (unfarmable).
     cfg.rewards["dance_beat_sync"] = RewardTermCfg(
