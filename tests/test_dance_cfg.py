@@ -159,7 +159,7 @@ def test_squat_bounce_lowest_point_on_the_beat():
     dz = _ref(microduck_mdp.DANCE_MOVE_SQUAT_BOUNCE, phase)["dz"]
     # lowest at integer beats (φ = 0 mod 2π), standing height at half beats
     amp = microduck_mdp.DANCE_SQUAT_AMPLITUDE
-    assert 0.03 <= amp <= 0.05  # design: ~3.8 cm（v7 DJ 级）
+    assert 0.04 <= amp <= 0.065  # design: ~4.8 cm（v10 狂炸级）
     assert torch.isclose(dz[0], torch.tensor(-amp), atol=1e-6)
     assert dz.min() >= -amp - 1e-6 and dz.max() <= 1e-6
     at_half_beat = _ref(
@@ -188,10 +188,10 @@ def test_head_bob_is_double_beat_frequency():
     phase = torch.linspace(0.0, 1.0, 1001)
     dhead = _ref(microduck_mdp.DANCE_MOVE_HEAD_BOB, phase)["dhead_pitch"]
     amp = microduck_mdp.DANCE_HEAD_BOB_AMPLITUDE
-    # D·sin(2φ): two full nods per beat, bounded by ±25°（v7 DJ 级）
+    # D·sin(2φ): two full nods per beat, bounded by ±30°（v10 狂炸级）
     expected = amp * torch.sin(2.0 * (2.0 * math.pi * phase))
     assert torch.allclose(dhead, expected, atol=1e-5)
-    assert amp <= math.radians(25.0) + 1e-9
+    assert amp <= math.radians(30.0) + 1e-9
 
 
 def test_reference_is_zero_outside_its_move():

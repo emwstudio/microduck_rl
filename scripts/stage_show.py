@@ -58,6 +58,15 @@ def formation_positions(n: int, kind: str) -> list[tuple[float, float]]:
         back = n - front
         pos += [(-SPACING, (i - (back - 1) / 2) * SPACING) for i in range(back)]
         return pos
+    if kind == "army":
+        # 阅兵方阵：cols 列 × rows 排矩形阵列，前排对齐
+        cols = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
+        return [
+            (-(r - (rows - 1) / 2) * SPACING, (c - (cols - 1) / 2) * SPACING)
+            for r in range(rows)
+            for c in range(cols)
+        ][:n]
     raise ValueError(f"unknown formation: {kind}")
 
 
@@ -139,13 +148,54 @@ class Duck:
 ACTION_SCALE = 1.0
 
 
+# 电影运镜关键帧：(t, azimuth°, elevation°, distance) —— 跟着《牛来》编舞设计：
+# 长音慢推 → DJ 预热低角度 → 三次 hook（7.13/10.38/14.60s）快速 punch-in → 结尾拉远
+CINEMATIC_KEYS = [
+    (0.00, 60.0, -45.0, 4.5),     # 高空俯瞰开场
+    (1.20, 75.0, -20.0, 2.6),     # 俯冲下降
+    (1.95, 90.0, -12.0, 2.0),     # 长音尾落位
+    (3.82, 140.0, -16.0, 1.75),   # DJ 预热低角度
+    (5.74, 195.0, -14.0, 1.6),
+    (7.05, 230.0, -15.0, 1.55),
+    (7.25, 235.0, -24.0, 0.95),   # 牛来①（方位角同向通过 → 丝滑）
+    (8.60, 280.0, -12.0, 1.9),
+    (10.45, 295.0, -15.0, 1.5),
+    (10.65, 300.0, -24.0, 0.95),  # 牛来②（10.65s = 快0.1/慢0.5 区间收敛）
+    (11.80, 308.0, -13.0, 1.75),  # 继续同向拉出
+    (13.60, 250.0, -13.0, 1.7),   # 折返放在两发 punch 之间的平缓段（1.8s 渐变）
+    (14.52, 225.0, -15.0, 1.5),
+    (14.72, 220.0, -24.0, 0.95),  # 牛来③
+    (16.90, 215.0, -10.0, 2.6),   # 收官 215°
+]
+
+
+def _smoothstep(u):
+    return u * u * (3.0 - 2.0 * u)
+
+
+def cinematic_camera(t):
+    """分段 smoothstep 插值关键帧，输出 (azimuth, elevation, distance)。"""
+    keys = CINEMATIC_KEYS
+    if t <= keys[0][0]:
+        return keys[0][1], keys[0][2], keys[0][3]
+    if t >= keys[-1][0]:
+        return keys[-1][1], keys[-1][2], keys[-1][3]
+    for i in range(len(keys) - 1):
+        t0, a0, e0, d0 = keys[i]
+        t1, a1, e1, d1 = keys[i + 1]
+        if t0 <= t <= t1:
+            u = _smoothstep((t - t0) / (t1 - t0))
+            return a0 + (a1 - a0) * u, e0 + (e1 - e0) * u, d0 + (d1 - d0) * u
+    return keys[-1][1], keys[-1][2], keys[-1][3]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--policy", type=Path, required=True)
     ap.add_argument("--timeline", type=Path, required=True)
     ap.add_argument("--ducks", type=int, default=6)
-    ap.add_argument("--formation", choices=["row", "arc", "grid"], default="row")
-    ap.add_argument("--camera", choices=["front", "tracking", "orbit"], default="front")
+    ap.add_argument("--formation", choices=["row", "arc", "grid", "army"], default="row")
+    ap.add_argument("--camera", choices=["front", "tracking", "orbit", "cinematic"], default="front")
     ap.add_argument("--record", type=Path, required=True)
     ap.add_argument("--width", type=int, default=1920)
     ap.add_argument("--height", type=int, default=1080)
@@ -194,7 +244,8 @@ def main():
     span = max(abs(p[1] - center_y) for p in positions) + SPACING
     camera.distance = max(0.9, span * 1.4)
     fps = int(round(1.0 / d2t.CONTROL_DT))
-    writer = imageio.get_writer(str(args.record), fps=fps)
+    # macro_block_size=1：允许精确 1920x1080（16:9），不做 16 像素对齐缩放
+    writer = imageio.get_writer(str(args.record), fps=fps, macro_block_size=1)
     print(f"Recording {args.width}x{args.height} → {args.record}")
 
     duration = float(timeline["duration"])
@@ -232,10 +283,16 @@ def main():
             camera.lookat[:] = [cx, cy, cz]
             camera.azimuth = 90.0
             camera.elevation = -12.0
-        else:  # orbit
+        elif args.camera == "orbit":
             camera.lookat[:] = [0.0, center_y, 0.12]
             camera.azimuth = 90.0 + args.orbit_deg_per_s * t
             camera.elevation = -15.0
+        else:  # cinematic：关键帧运镜
+            camera.lookat[:] = [0.0, center_y, 0.12]
+            az, el, dist = cinematic_camera(t)
+            camera.azimuth = az
+            camera.elevation = el
+            camera.distance = dist
         renderer.update_scene(data, camera=camera)
         writer.append_data(renderer.render())
 

@@ -135,7 +135,7 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # Main objective: track the analytic reference motion.
     cfg.rewards["dance_body_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_body_tracking,
-        weight=2.0,
+        weight=2.5,
         params={
             "command_name": "body_pose",
             "nominal_height": DANCE_NOMINAL_HEIGHT,

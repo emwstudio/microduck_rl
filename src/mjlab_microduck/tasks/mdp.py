@@ -7226,24 +7226,27 @@ DANCE_MOVE_LEN_BEATS = (8.0, 16.0)
 # Amplitude measured against the standing equilibrium STAND_Z=0.115 (the same
 # constant the standup/ball_kick envs use — do not re-derive from the keyframe
 # FK height 0.12, which ignores contact compression).
-DANCE_SQUAT_AMPLITUDE = 0.038  # m — dip depth below nominal standing height
+DANCE_SQUAT_AMPLITUDE = 0.048  # m — dip depth below nominal standing height
 # weight_shift: trunk roll ±8°, period = 2 beats (left one beat, right one
 # beat). The ankle joints are PITCH-axis on this robot (no ankle roll), so the
 # joint-space reference is carried by the hip_roll pair alone, feet stay flat.
-DANCE_ROLL_AMPLITUDE = math.radians(13.0)
-DANCE_HIP_ROLL_AMPLITUDE = math.radians(11.0)
-# head_bob: head_pitch nods at 2× the beat frequency, ±25° around HOME.
-DANCE_HEAD_BOB_AMPLITUDE = math.radians(25.0)
+DANCE_ROLL_AMPLITUDE = math.radians(16.0)
+DANCE_HIP_ROLL_AMPLITUDE = math.radians(14.0)
+# head_bob: head_pitch nods at 2× the beat frequency, ±30° around HOME.
+DANCE_HEAD_BOB_AMPLITUDE = math.radians(30.0)
 # climax（歌曲高潮专用 combo）：深蹲 + 大摆胯 + 点头 + 甩头同时上，全面夸张。
 # 同一个 move id 驱动所有重复高潮段 → 每次高潮动作一致。
-DANCE_CLIMAX_SQUAT = 0.045  # m
-DANCE_CLIMAX_ROLL = math.radians(16.0)
-DANCE_CLIMAX_HIP_ROLL = math.radians(13.0)
-DANCE_CLIMAX_HEAD_BOB = math.radians(28.0)
-DANCE_CLIMAX_HEAD_YAW = math.radians(25.0)
-# call_out（长音呼喊）：头持续抬高（喙朝天 = 张嘴高歌感），缓慢侧摇。
+DANCE_CLIMAX_SQUAT = 0.058  # m
+DANCE_CLIMAX_ROLL = math.radians(20.0)
+DANCE_CLIMAX_HIP_ROLL = math.radians(16.0)
+DANCE_CLIMAX_HEAD_BOB = math.radians(34.0)
+DANCE_CLIMAX_HEAD_YAW = math.radians(32.0)
+# call_out（长音呼喊）：头持续抬高（喙朝天 = 张嘴高歌感），身体缓慢摇摆
+# （2 拍周期，长音也要有动感）。
 DANCE_CALL_OUT_PITCH = math.radians(15.0)
 DANCE_CALL_OUT_ROLL = math.radians(5.0)
+DANCE_CALL_OUT_BODY_ROLL = math.radians(6.0)
+DANCE_CALL_OUT_HIP_ROLL = math.radians(4.5)
 
 # Key joints constrained by the joint-space reference (dance_joint_tracking).
 # hip_roll: both legs, same-sign delta (rolls the trunk). head_pitch: the bob.
@@ -7281,6 +7284,7 @@ def dance_reference(
     is_shift = move_id == DANCE_MOVE_WEIGHT_SHIFT
     is_bob = move_id == DANCE_MOVE_HEAD_BOB
     is_climax = move_id == DANCE_MOVE_CLIMAX
+    is_call = move_id == DANCE_MOVE_CALL_OUT
 
     zero = torch.zeros_like(phi)
     half = 0.5 * phi
@@ -7291,17 +7295,24 @@ def dance_reference(
     dz = torch.where(for_squat, -0.5 * amp_z * (1.0 + torch.cos(phi)), zero)
     vz_ref = torch.where(for_squat, 0.5 * amp_z * omega * torch.sin(phi), zero)
     # Weight shift: roll = B·sin(φ/2) — period 2 beats (one beat per side).
-    # climax 摆更大的同一波形。
-    for_shift = is_shift | is_climax
-    amp_r = torch.where(is_climax, DANCE_CLIMAX_ROLL, DANCE_ROLL_AMPLITUDE)
-    amp_h = torch.where(is_climax, DANCE_CLIMAX_HIP_ROLL, DANCE_HIP_ROLL_AMPLITUDE)
+    # climax 摆更大的同一波形；call_out 用温和的身体慢摇（长音造型 + 动感）。
+    for_shift = is_shift | is_climax | is_call
+    amp_r = torch.where(
+        is_climax,
+        DANCE_CLIMAX_ROLL,
+        torch.where(is_call, DANCE_CALL_OUT_BODY_ROLL, DANCE_ROLL_AMPLITUDE),
+    )
+    amp_h = torch.where(
+        is_climax,
+        DANCE_CLIMAX_HIP_ROLL,
+        torch.where(is_call, DANCE_CALL_OUT_HIP_ROLL, DANCE_HIP_ROLL_AMPLITUDE),
+    )
     droll = torch.where(for_shift, amp_r * torch.sin(half), zero)
     roll_rate_ref = torch.where(for_shift, amp_r * 0.5 * omega * torch.cos(half), zero)
     dhip = torch.where(for_shift, amp_h * torch.sin(half), zero)
     # Head bob: head_pitch = D·sin(2φ) — 2 nods per beat.
     # climax 改为点头锤：-A·cos(φ)，拍间抬头（φ=π 最高）、正拍猛砸（φ=0 最低）——
     # 每个正拍必砸中，歌曲 hook（如"牛来"）落在拍点上时必然配合到。
-    is_call = move_id == DANCE_MOVE_CALL_OUT
     dhead_bob = DANCE_HEAD_BOB_AMPLITUDE * torch.sin(2.0 * phi)
     dhead_climax = -DANCE_CLIMAX_HEAD_BOB * torch.cos(phi)
     dhead = torch.where(
