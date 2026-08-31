@@ -7195,8 +7195,8 @@ def roulade_lateral_velocity_penalty(
 # the shared 13D command block) is semantically RE-MAPPED to a dance command
 # (the obs layout is unchanged, so ONNX/runtime hot-swap parity holds):
 #
-#   body_pose[0] = sin(φ)          beat phase, φ = 2π·t·BPM/60
-#   body_pose[1] = cos(φ)
+#   body_pose[0] = sin(φ/2)        beat phase over a 2-BEAT cycle, φ = 2π·t·BPM/60
+#   body_pose[1] = cos(φ/2)        (2-beat wrap: odd/even beats distinguishable)
 #   body_pose[2] = tempo_norm      BPM / 120, BPM sampled in DANCE_BPM_RANGE
 #   body_pose[3] = one-hot move 0  squat_bounce
 #   body_pose[4] = one-hot move 1  weight_shift
@@ -7205,8 +7205,10 @@ def roulade_lateral_velocity_penalty(
 # The twist(3) and head_pose(4) slots keep their original semantics with tiny
 # non-zero sampling ranges (dead-weight guard). Reference motions are analytic
 # functions of the beat phase held by DanceCommand — rewards read the phase
-# from the command TERM (unwrapped, so 2-beat moves are unambiguous), while the
-# policy only ever sees the wrapped (sin, cos) encoding.
+# from the command TERM (unwrapped, so 2-beat moves are unambiguous). The policy
+# sees the phase wrapped over TWO beats: a per-beat (sin φ, cos φ) encoding is
+# identical on odd/even beats, which made weight_shift's sin(φ/2) reference
+# unobservable — the policy learned to not roll at all (v2 deployment finding).
 
 DANCE_MOVE_SQUAT_BOUNCE = 0
 DANCE_MOVE_WEIGHT_SHIFT = 1
@@ -7332,9 +7334,12 @@ class DanceCommand(CommandTerm):
         return self._move_id
 
     def _write_command(self) -> None:
-        phi = 2.0 * math.pi * self._phase_beats
-        self._command[:, 0] = torch.sin(phi)
-        self._command[:, 1] = torch.cos(phi)
+        # Phase encoded over a TWO-BEAT cycle (π per beat): squat (1-beat) and
+        # head_bob (half-beat) references remain functions of it, and the 2-beat
+        # weight_shift reference becomes fully observable.
+        phi_half = math.pi * self._phase_beats
+        self._command[:, 0] = torch.sin(phi_half)
+        self._command[:, 1] = torch.cos(phi_half)
         self._command[:, 2] = self._bpm / 120.0
         one_hot = torch.zeros(self.num_envs, DANCE_NUM_MOVES, device=self.device)
         one_hot.scatter_(1, self._move_id.unsqueeze(1), 1.0)
