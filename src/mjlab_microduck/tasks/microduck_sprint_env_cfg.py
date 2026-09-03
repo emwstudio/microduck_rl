@@ -60,6 +60,22 @@ high IN PLACE (air_time_mean 0.17 s, error_vel_xy 2.1 m/s, eval speed
      otherwise gets no on-policy data, so propulsion at speed is
      unlearnable).
 
+Recipe v4 (2026-09-04) — 短距离爆发极速（用户：不看长距离稳定，摔了有
+垫子接，追求起步后短距离内最高速度）。v3 续训到 6000 迭代实测全部
+checkpoint  plateau/回退（峰值仍是 2000 轮的 1.43 m/s）：不是步数问题，
+是 track 高斯在 2 m/s 误差处梯度为零——70% 从静止起步的 env 在 1 m/s
+以上没有加速梯度。
+
+  1. 命令速度课程（commands_vel）：lin_vel_x 上限 0.8 → 1.2 → 1.6 → 2.0
+     分四段 —— 每段的 tracking 误差都落在高斯有梯度的范围内，前沿始终
+     在能力边缘（「课程与策略已学会的东西相位对齐」）。
+  2. 辅助超宽松 tracking 项（std=1.0, weight 1.0）：全速度域保底梯度
+     （2 m/s 误差处 exp(-4)≈0.018 而非 exp(-16)≈0）。
+  3. init_velocity_prob 0.3 → 0.5：一半 env 出生在命令速度，高速在策略
+     数据翻倍（爆发导向）。
+  4. episode_length_s 20 → 10：reset 频率翻倍，单位时间的起步/加速
+     练习翻倍 —— 短距离极速要的是发射段，不是巡航。
+
 Flat terrain only. 61D obs contract preserved (twist(3) + head_pose(4) +
 body_pose(6)) → the exported ONNX hot-swaps into the runtime walking slot.
 """
@@ -68,7 +84,8 @@ import math
 from copy import deepcopy
 
 from mjlab.envs import ManagerBasedRlEnvCfg
-from mjlab.managers import CurriculumTermCfg
+from mjlab.managers import CurriculumTermCfg, RewardTermCfg
+from mjlab.tasks.velocity import mdp
 from mjlab.rl import (
     RslRlOnPolicyRunnerCfg,
     RslRlModelCfg,
@@ -80,8 +97,16 @@ from mjlab_microduck.tasks.microduck_velocity_env_cfg import (
 )
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg
 
-# Sprint command ranges (see module docstring).
-LIN_VEL_X_RANGE = (-0.2, 2.0)
+# Sprint command ranges (see module docstring). v4: lin_vel_x 上限走课程，
+# 初始档必须落在当前能力内有梯度的范围；(-0.2, 2.0) 是课程终点。
+LIN_VEL_X_START = (-0.1, 0.8)
+LIN_VEL_X_FINAL = (-0.2, 2.0)
+LIN_VEL_X_STAGES = [
+    {"step": 0,          "lin_vel_x": (-0.1, 0.8)},
+    {"step": 750 * 24,   "lin_vel_x": (-0.15, 1.2)},
+    {"step": 1500 * 24,  "lin_vel_x": (-0.2, 1.6)},
+    {"step": 2500 * 24,  "lin_vel_x": (-0.2, 2.0)},
+]
 LIN_VEL_Y_RANGE = (-0.1, 0.1)   # was ±0.3 — 收窄
 ANG_VEL_Z_RANGE = (-0.5, 0.5)   # was ±1.0 — 收窄
 REL_FORWARD_ENVS = 0.5          # half the envs run forward-only commands
@@ -110,8 +135,14 @@ UPRIGHT_STD = math.sqrt(0.1)
 # v3: velocity tracking is THE objective; air time only shapes the gait.
 TRACK_LIN_VEL_WEIGHT = 4.0   # was 2.0
 AIR_TIME_WEIGHT = 1.5        # was 3.0
-# v3: reverse-curriculum spawns — 30% of envs start AT the commanded velocity.
-INIT_VELOCITY_PROB = 0.3
+# v3/v4: reverse-curriculum spawns — half of envs start AT the commanded
+# velocity (burst-focused: double the at-speed on-policy data).
+INIT_VELOCITY_PROB = 0.5
+# v4: 短距离爆发 —— 10s episodes double the launch practice per GPU-hour.
+EPISODE_LENGTH_S = 10.0
+# v4: auxiliary loose tracking term — gradient floor over the whole speed range.
+TRACK_LIN_VEL_LOOSE_WEIGHT = 1.0
+TRACK_LIN_VEL_LOOSE_STD = 1.0
 
 # Velocity-tracking std: loose enough that sprint-speed errors still see gradient.
 TRACK_LIN_VEL_STD = math.sqrt(0.25)
@@ -126,9 +157,9 @@ def make_microduck_sprint_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     """Sprint-specialised velocity env (flat). See module docstring."""
     cfg = make_microduck_velocity_env_cfg(play=play, rough=False)
 
-    # --- Commands: sprint ranges + straight-line bias ---
+    # --- Commands: sprint ranges + straight-line bias + speed curriculum ---
     command = cfg.commands["twist"]
-    command.ranges.lin_vel_x = LIN_VEL_X_RANGE
+    command.ranges.lin_vel_x = LIN_VEL_X_START
     command.ranges.lin_vel_y = LIN_VEL_Y_RANGE
     command.ranges.ang_vel_z = ANG_VEL_Z_RANGE
     command.rel_turn_in_place_envs = TURN_IN_PLACE_FRACTION
@@ -170,6 +201,27 @@ def make_microduck_sprint_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
     # --- v2 fix 4: allow acceleration lean ---
     cfg.rewards["upright"].params["std"] = UPRIGHT_STD
+
+    # --- v4: command-speed curriculum (gradient alive at every stage) ---
+    from mjlab.tasks.velocity.mdp import commands_vel
+
+    cfg.curriculum["command_vel"] = CurriculumTermCfg(
+        func=commands_vel,
+        params={
+            "command_name": "twist",
+            "velocity_stages": LIN_VEL_X_STAGES,
+        },
+    )
+
+    # --- v4: loose tracking floor term ---
+    cfg.rewards["track_linear_velocity_loose"] = RewardTermCfg(
+        func=mdp.track_linear_velocity,
+        weight=TRACK_LIN_VEL_LOOSE_WEIGHT,
+        params={"command_name": "twist", "std": TRACK_LIN_VEL_LOOSE_STD},
+    )
+
+    # --- v4: short episodes = burst training ---
+    cfg.episode_length_s = EPISODE_LENGTH_S
 
     return cfg
 
