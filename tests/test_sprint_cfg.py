@@ -44,10 +44,9 @@ def test_air_time_window_curriculum_ratchets_up_to_flight_phase():
     assert stages[-1]["threshold_max"] == AIR_TIME_MAX_S
     mins = [st["threshold_min"] for st in stages]
     assert mins == sorted(mins)  # 单调上移
-    # 权重与命令门限沿用 walking 配方
-    walk = make_microduck_velocity_env_cfg()
-    assert sprint.rewards["air_time"].weight == walk.rewards["air_time"].weight == 3.0
-    assert params["command_threshold"] == 0.01
+    # v3：权重降为 1.5（只塑形），前向门控阈值 0.1
+    assert sprint.rewards["air_time"].weight == 1.5
+    assert params["command_threshold"] == 0.1
 
 
 def test_tracking_std_keeps_gradient_at_sprint_speed():
@@ -56,6 +55,8 @@ def test_tracking_std_keeps_gradient_at_sprint_speed():
     std = cfg.rewards["track_linear_velocity"].params["std"]
     assert std == math.sqrt(0.25)
     assert math.exp(-(1.0 / std) ** 2) > 0.01  # 1 m/s 误差处仍有可见梯度
+    # v3：tracking 是主导目标
+    assert cfg.rewards["track_linear_velocity"].weight == 4.0
 
 
 def test_anti_violence_regularizers_inherited():
@@ -72,6 +73,16 @@ def test_anti_violence_regularizers_inherited():
     assert cfg.rewards["self_collisions"].weight < 0
     assert cfg.rewards["foot_slip"].weight < 0
     assert cfg.rewards["dof_pos_limits"].weight < 0
+
+
+def test_air_time_is_forward_gated():
+    # v3 核心：原地腾空刷分必须支付 0 —— 门控函数替换 + 逆向课程出生
+    from mjlab_microduck.tasks import mdp as microduck_mdp
+
+    cfg = make_microduck_sprint_env_cfg()
+    assert cfg.rewards["air_time"].func is microduck_mdp.feet_air_time_forward
+    # 30% env 出生在命令速度状态（reverse-curriculum：高速前沿否则没有在策略数据）
+    assert cfg.commands["twist"].init_velocity_prob == 0.3
 
 
 def test_upright_std_allows_sprint_lean():

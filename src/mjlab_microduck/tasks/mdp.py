@@ -3375,6 +3375,48 @@ def velocity_tracking_std_curriculum(
     return torch.tensor([current_std])
 
 
+def feet_air_time_forward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    threshold_min: float = 0.05,
+    threshold_max: float = 0.5,
+    command_name: str = "twist",
+    command_threshold: float = 0.1,
+) -> torch.Tensor:
+    """feet_air_time gated by actual forward progress (sprint task).
+
+    Stock feet_air_time pays for long swings regardless of where the robot
+    goes — sprint v2 farmed it by stepping high IN PLACE (air_time_mean 0.17 s
+    while error_vel_xy stayed at 2.1 m/s). Encode the maneuver in the gate:
+    each in-window foot-air step pays proportionally to
+    clamp(vx_actual / vx_commanded, 0, 1) — stationary stepping pays 0,
+    tracking the sprint command pays full. Only active for forward commands
+    above command_threshold (zero/backup commands pay nothing).
+    """
+    from mjlab.sensor import ContactSensor
+
+    sensor: ContactSensor = env.scene[sensor_name]
+    current_air_time = sensor.data.current_air_time
+    assert current_air_time is not None
+    in_range = (current_air_time > threshold_min) & (current_air_time < threshold_max)
+    reward = torch.sum(in_range.float(), dim=1)
+
+    in_air = current_air_time > 0
+    num_in_air = torch.sum(in_air.float())
+    mean_air_time = torch.sum(current_air_time * in_air.float()) / torch.clamp(
+        num_in_air, min=1
+    )
+    env.extras["log"]["Metrics/air_time_mean"] = mean_air_time
+
+    command = env.command_manager.get_command(command_name)
+    cmd_vx = command[:, 0]
+    vx = env.scene["robot"].data.root_link_lin_vel_b[:, 0]
+    progress = torch.clamp(vx / torch.clamp(cmd_vx, min=1e-3), 0.0, 1.0)
+    env.extras["log"]["Metrics/air_time_forward_progress"] = progress.mean()
+    scale = (cmd_vx > command_threshold).float()
+    return reward * progress * scale
+
+
 def air_time_window_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,

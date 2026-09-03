@@ -47,6 +47,19 @@ at making motion the argmax again:
   4. upright std loosened sqrt(0.05) → sqrt(0.1): acceleration needs forward
      lean; the walking-tight tolerance priced lean as heavily as falling.
 
+Recipe v3 (2026-09-03) — v2 lesson: the policy farmed air_time by stepping
+high IN PLACE (air_time_mean 0.17 s, error_vel_xy 2.1 m/s, eval speed
+0.04-0.11 m/s). Additive stacks get hacked on their under-specified terms:
+
+  1. air_time is now FORWARD-GATED (feet_air_time_forward): in-window air
+     steps pay × clamp(vx_actual / vx_commanded, 0, 1) — in-place flight
+     pays exactly 0. Weight 3.0 → 1.5 (shaping, not a second objective).
+  2. track_linear_velocity weight 2.0 → 4.0 — the dominant objective.
+  3. init_velocity_prob = 0.3: a third of envs spawn ALREADY at their
+     commanded velocity (reverse-curriculum spawns — the 2 m/s frontier
+     otherwise gets no on-policy data, so propulsion at speed is
+     unlearnable).
+
 Flat terrain only. 61D obs contract preserved (twist(3) + head_pose(4) +
 body_pose(6)) → the exported ONNX hot-swaps into the runtime walking slot.
 """
@@ -94,6 +107,12 @@ ACTION_RATE_FINAL = -0.3
 # v2 fix 4: sprint needs forward lean; walking-tight upright prices it out.
 UPRIGHT_STD = math.sqrt(0.1)
 
+# v3: velocity tracking is THE objective; air time only shapes the gait.
+TRACK_LIN_VEL_WEIGHT = 4.0   # was 2.0
+AIR_TIME_WEIGHT = 1.5        # was 3.0
+# v3: reverse-curriculum spawns — 30% of envs start AT the commanded velocity.
+INIT_VELOCITY_PROB = 0.3
+
 # Velocity-tracking std: loose enough that sprint-speed errors still see gradient.
 TRACK_LIN_VEL_STD = math.sqrt(0.25)
 
@@ -114,10 +133,14 @@ def make_microduck_sprint_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     command.ranges.ang_vel_z = ANG_VEL_Z_RANGE
     command.rel_turn_in_place_envs = TURN_IN_PLACE_FRACTION
     command.rel_forward_envs = REL_FORWARD_ENVS
+    command.init_velocity_prob = INIT_VELOCITY_PROB
 
-    # --- Flight-phase incentive: reachable window, ratcheted up by curriculum ---
+    # --- Flight-phase incentive: forward-gated air time + staged window ---
+    cfg.rewards["air_time"].func = microduck_mdp.feet_air_time_forward
+    cfg.rewards["air_time"].weight = AIR_TIME_WEIGHT
     cfg.rewards["air_time"].params["threshold_min"] = AIR_TIME_MIN_START_S
     cfg.rewards["air_time"].params["threshold_max"] = AIR_TIME_MAX_S
+    cfg.rewards["air_time"].params["command_threshold"] = 0.1
     cfg.curriculum["air_time_window"] = CurriculumTermCfg(
         func=microduck_mdp.air_time_window_curriculum,
         params={
@@ -126,8 +149,9 @@ def make_microduck_sprint_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
     )
 
-    # --- Tracking gradient at sprint speeds ---
+    # --- Tracking gradient at sprint speeds + dominant weight ---
     cfg.rewards["track_linear_velocity"].params["std"] = TRACK_LIN_VEL_STD
+    cfg.rewards["track_linear_velocity"].weight = TRACK_LIN_VEL_WEIGHT
 
     # --- v2 fix 1: cap the stand-and-farm reward mass ---
     cfg.curriculum["standing_envs"].params["standing_stages"] = [
