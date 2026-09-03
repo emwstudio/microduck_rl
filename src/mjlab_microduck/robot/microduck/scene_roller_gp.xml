@@ -1,0 +1,78 @@
+<mujoco model="scene_roller_gp">
+    <!-- 鸭子轮滑大奖赛赛道：scene_rollers.xml + 关卡几何（全部静态 worldbody geoms）
+         段落配色：直道地面默认 / 桩橙 / 发卡桶红 / 坡道桥钢灰 / 迷宫墙蓝灰 / 停车位亮绿框
+         坡度 8°/10°（上游 RollerSlope 训练范围 2-20°，roller.onnx 是平地策略，取下沿）
+         桥宽 0.32m（≈2 倍脚宽）；停车位 0.5×0.5m（视觉框无碰撞） -->
+    <include file="robot_groundcontact_rollers.xml" />
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+        <rgba haze="0.15 0.25 0.35 1" />
+        <global azimuth="160" elevation="-20" />
+    </visual>
+
+    <asset>
+        <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512"
+            height="3072" />
+        <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
+            rgb2="0.1 0.2 0.3"
+            markrgb="0.8 0.8 0.8" width="300" height="300" />
+        <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5"
+            reflectance="0.2" />
+    </asset>
+
+    <worldbody>
+        <light pos="0 0 3.5" dir="0 0 -1" directional="true" />
+        <geom name="floor" size="0 0 0.05" pos="0 0 0" type="plane" material="groundplane" />
+
+        <!-- S2 S 弯桩柱 ×5（橙色圆桩，交替 y=±0.3，间距 0.5m） -->
+        <geom name="cone1" type="cylinder" pos="3.5 0.3 0.25"  size="0.05 0.25" rgba="1 0.5 0.1 1"/>
+        <geom name="cone2" type="cylinder" pos="4.0 -0.3 0.25" size="0.05 0.25" rgba="1 0.5 0.1 1"/>
+        <geom name="cone3" type="cylinder" pos="4.5 0.3 0.25"  size="0.05 0.25" rgba="1 0.5 0.1 1"/>
+        <geom name="cone4" type="cylinder" pos="5.0 -0.3 0.25" size="0.05 0.25" rgba="1 0.5 0.1 1"/>
+        <geom name="cone5" type="cylinder" pos="5.5 0.3 0.25"  size="0.05 0.25" rgba="1 0.5 0.1 1"/>
+
+        <!-- S3 发卡弯标志桶（红色大桶，绕它掉头） -->
+        <geom name="barrel" type="cylinder" pos="6.8 0.3 0.3" size="0.15 0.3" rgba="0.9 0.15 0.1 1"/>
+
+        <!-- S4 冲坡（返程车道 y=0.9，-x 方向上行 3.3°：x 5.4→4.0 升到 z=0.08；
+             两次降坡：8°→5.7° 都因平地策略上坡再加速太弱在坡顶前失速，
+             0.08m 台高是「难但可行」实测区间） -->
+        <geom name="ramp_up" type="box" pos="4.7 0.9 0.01" size="0.7 0.35 0.03"
+              euler="0 0.057 0" rgba="0.45 0.5 0.55 1"/>
+        <!-- 平台（x 4.0→3.2，顶面 z=0.08，比桥宽） -->
+        <geom name="plateau" type="box" pos="3.6 0.9 0.04" size="0.4 0.35 0.04"
+              rgba="0.45 0.5 0.55 1"/>
+        <!-- S5 独木桥（x 3.2→1.2，顶面 z=0.08，宽 0.32m，两侧落差 0.08m） -->
+        <geom name="bridge" type="box" pos="2.2 0.9 0.04" size="1.0 0.16 0.04"
+              rgba="0.6 0.6 0.65 1"/>
+        <!-- 下坡（x 1.2→0.4，-x 方向下行 5.7°） -->
+        <geom name="ramp_down" type="box" pos="0.8 0.9 0.01" size="0.4 0.35 0.03"
+              euler="0 -0.10 0" rgba="0.45 0.5 0.55 1"/>
+
+        <!-- S6 迷宫墙（蓝灰）：W1 纵墙逼出「左 90° + 右 90°」 -->
+        <geom name="wall1" type="box" pos="-0.1 0.5 0.3" size="0.02 0.3 0.3"
+              rgba="0.35 0.45 0.65 1"/>
+        <!-- W2 横墙：停车位的前景框 -->
+        <geom name="wall2" type="box" pos="0.2 -0.35 0.3" size="0.35 0.02 0.3"
+              rgba="0.35 0.45 0.65 1"/>
+
+        <!-- S7 停车位：0.5×0.5m 亮绿框（纯视觉，无碰撞） -->
+        <geom name="park_frame" type="box" pos="0.5 0.15 0.004" size="0.25 0.25 0.004"
+              rgba="0.2 1 0.3 0.55" contype="0" conaffinity="0"/>
+    </worldbody>
+
+    <keyframe>
+        <key name="STAND" qpos="
+        0 0 0.1385 1 0 0 0
+        0 -0.08726646259971647 -0.457924 -0.004940 0.452984  0 0
+        0.3490658503988659 0.3490658503988659 0 0
+        0 0.08726646259971647 0.457924 0.004940 -0.452984 0 0"
+         ctrl="
+        0 -0.08726646259971647 -0.457924 -0.004940 0.452984
+        0.3490658503988659 0.3490658503988659 0 0
+        0 0.08726646259971647 0.457924 0.004940 -0.452984"
+        />
+    </keyframe>
+
+</mujoco>
