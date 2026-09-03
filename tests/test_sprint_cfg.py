@@ -4,7 +4,9 @@ import math
 
 from mjlab_microduck.tasks.microduck_sprint_env_cfg import (
     AIR_TIME_MAX_S,
-    AIR_TIME_MIN_S,
+    AIR_TIME_MIN_FINAL_S,
+    AIR_TIME_MIN_START_S,
+    AIR_TIME_WINDOW_STAGES,
     make_microduck_sprint_env_cfg,
     MicroduckSprintRlCfg,
 )
@@ -26,20 +28,26 @@ def test_sprint_command_ranges():
     assert cmd.rel_forward_envs == 0.5
 
 
-def test_air_time_window_shifted_up_for_flight_phase():
+def test_air_time_window_curriculum_ratchets_up_to_flight_phase():
+    # v2 教训：feet_air_time 是阶跃函数，固定 0.20s 下限从行走步态永远够不到
+    # （v1 全程 air_time 奖励 ≈0）。初始窗口必须可达，再由课程逐段上移。
     sprint = make_microduck_sprint_env_cfg()
-    walk = make_microduck_velocity_env_cfg()
-    s_min = sprint.rewards["air_time"].params["threshold_min"]
-    s_max = sprint.rewards["air_time"].params["threshold_max"]
-    w_min = walk.rewards["air_time"].params["threshold_min"]
-    w_max = walk.rewards["air_time"].params["threshold_max"]
-    # 窗口整体上移：只有更长的腾空（跑步飞行相）才得分
-    assert (s_min, s_max) == (AIR_TIME_MIN_S, AIR_TIME_MAX_S)
-    assert s_min > w_min
-    assert s_max > w_max
+    params = sprint.rewards["air_time"].params
+    assert (params["threshold_min"], params["threshold_max"]) == (
+        AIR_TIME_MIN_START_S,
+        AIR_TIME_MAX_S,
+    )
+    # 课程存在且终点 = 跑步飞行相窗口
+    stages = sprint.curriculum["air_time_window"].params["window_stages"]
+    assert stages == AIR_TIME_WINDOW_STAGES
+    assert stages[-1]["threshold_min"] == AIR_TIME_MIN_FINAL_S
+    assert stages[-1]["threshold_max"] == AIR_TIME_MAX_S
+    mins = [st["threshold_min"] for st in stages]
+    assert mins == sorted(mins)  # 单调上移
     # 权重与命令门限沿用 walking 配方
+    walk = make_microduck_velocity_env_cfg()
     assert sprint.rewards["air_time"].weight == walk.rewards["air_time"].weight == 3.0
-    assert sprint.rewards["air_time"].params["command_threshold"] == 0.01
+    assert params["command_threshold"] == 0.01
 
 
 def test_tracking_std_keeps_gradient_at_sprint_speed():
@@ -52,16 +60,25 @@ def test_tracking_std_keeps_gradient_at_sprint_speed():
 
 def test_anti_violence_regularizers_inherited():
     cfg = make_microduck_sprint_env_cfg()
-    # 动作平滑课程：起点 -0.1，终点 -1.0
+    # 动作平滑课程：起点 -0.1，v2 封顶 -0.3（-1.0 是 sprint 摆腿的 motion-blocker）
     assert cfg.rewards["action_rate_l2"].weight == -0.1
     stages = cfg.curriculum["action_rate_weight"].params["weight_stages"]
-    assert stages[-1]["weight"] == -1.0
+    assert stages[-1]["weight"] == -0.3
+    weights = [st["weight"] for st in stages]
+    assert weights == sorted(weights, reverse=True)  # 单调加税
     # 躯干晃动 / 角动量 / 自碰撞 / 打滑 / 关节限位：全部为负权重惩罚
     assert cfg.rewards["body_ang_vel"].weight < 0
     assert cfg.rewards["angular_momentum"].weight < 0
     assert cfg.rewards["self_collisions"].weight < 0
     assert cfg.rewards["foot_slip"].weight < 0
     assert cfg.rewards["dof_pos_limits"].weight < 0
+
+
+def test_upright_std_allows_sprint_lean():
+    # v2：加速前倾必须买得起（walking 的 sqrt(0.05) 把前倾当摔倒定价）
+    cfg = make_microduck_sprint_env_cfg()
+    assert cfg.rewards["upright"].params["std"] == math.sqrt(0.1)
+    assert cfg.rewards["upright"].weight == 2.0  # 权重不动，只放宽容差
 
 
 def test_bam_and_nan_guard_invariants_kept():
@@ -106,7 +123,8 @@ def test_zero_command_behavior_still_trained():
     cfg = make_microduck_sprint_env_cfg()
     stages = cfg.curriculum["standing_envs"].params["standing_stages"]
     assert stages[0]["rel_standing_envs"] > 0.0
-    assert stages[-1]["rel_standing_envs"] == 0.25
+    # v2：站立奖励质量封顶 5%（v1 的 25% 教会了策略无视命令站桩）
+    assert stages[-1]["rel_standing_envs"] == 0.05
 
 
 def test_runner_cfg_is_sprint_specific():

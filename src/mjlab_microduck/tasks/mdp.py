@@ -3375,6 +3375,43 @@ def velocity_tracking_std_curriculum(
     return torch.tensor([current_std])
 
 
+def air_time_window_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    reward_name: str,
+    window_stages: list[dict],
+) -> torch.Tensor:
+    """Shift the feet_air_time [threshold_min, threshold_max] window up by stages.
+
+    feet_air_time is a STEP function: a foot scores only while its current air
+    time is inside the window. If the window starts above what the bootstrap
+    gait can reach (~0.05 s/foot), the term pays zero forever and gives no
+    gradient toward a flight phase (the sprint-v1 failure). Starting the window
+    low and ratcheting it up gives a reachable gradient at every stage.
+
+    Args:
+        env: The RL environment
+        env_ids: Environment IDs (unused, but required by curriculum interface)
+        reward_name: Name of the reward term (e.g., "air_time")
+        window_stages: List of dicts with 'step', 'threshold_min', 'threshold_max'
+    """
+    del env_ids  # Unused
+
+    reward_term_cfg = env.reward_manager.get_term_cfg(reward_name)
+
+    current_min = window_stages[0]["threshold_min"]
+    current_max = window_stages[0]["threshold_max"]
+    for stage in window_stages:
+        if env.common_step_counter > stage["step"]:
+            current_min = stage["threshold_min"]
+            current_max = stage["threshold_max"]
+
+    reward_term_cfg.params["threshold_min"] = current_min
+    reward_term_cfg.params["threshold_max"] = current_max
+
+    return torch.tensor([current_min])
+
+
 def push_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
