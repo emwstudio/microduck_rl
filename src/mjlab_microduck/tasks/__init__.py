@@ -79,6 +79,10 @@ from .microduck_dance_env_cfg import (
     make_microduck_dance_env_cfg,
     MicroduckDanceRlCfg,
 )
+from .microduck_sprint_env_cfg import (
+    make_microduck_sprint_env_cfg,
+    MicroduckSprintRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Standard velocity task
@@ -87,6 +91,15 @@ register_mjlab_task(
     env_cfg=make_microduck_velocity_env_cfg(),
     play_env_cfg=make_microduck_velocity_env_cfg(play=True),
     rl_cfg=MicroduckRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Sprint task — barefoot flat-ground top speed (target: beat the 1.6 m/s mark).
+register_mjlab_task(
+    task_id="Mjlab-Sprint-Flat-MicroDuck",
+    env_cfg=make_microduck_sprint_env_cfg(),
+    play_env_cfg=make_microduck_sprint_env_cfg(play=True),
+    rl_cfg=MicroduckSprintRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
