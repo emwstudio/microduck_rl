@@ -183,11 +183,16 @@ def _roll_pitch_from_quat(quat):
 class DanceHarness:
     """61D obs assembly + action application, mirroring infer_policy.py."""
 
-    def __init__(self, model, data, ort_session=None, action_scale=1.0):
+    def __init__(self, model, data, ort_session=None, action_scale=1.0,
+                 joint_vel_delay: int = 0):
         self.model = model
         self.data = data
         self.ort_session = ort_session
         self.action_scale = action_scale
+        # 训练里 joint_vel 有 1 个控制步延迟（Dynamixel 固件滑动平均）。部署侧
+        # 排练高速策略时设 joint_vel_delay=1 复现；0 = 传统即时读取。
+        self.joint_vel_delay = joint_vel_delay
+        self._jv_hist: list = []
         if ort_session is not None:
             self.input_name = ort_session.get_inputs()[0].name
             self.output_name = ort_session.get_outputs()[0].name
@@ -225,12 +230,17 @@ class DanceHarness:
     def get_observations(self):
         """61D: ang_vel(3) proj_grav(3) joint_pos_rel(14) joint_vel(14)
         last_action(14) command(13) — identical layout to infer_policy.py."""
+        jv_now = self.data.qvel[self.joint_qvel_indices].copy().astype(np.float32)
+        self._jv_hist.append(jv_now)
+        if len(self._jv_hist) > self.joint_vel_delay + 1:
+            self._jv_hist.pop(0)
+        jv = self._jv_hist[0] if self._jv_hist else jv_now
         obs = [
             self.get_base_ang_vel(),
             self.get_projected_gravity(),
             self.data.qpos[self.joint_qpos_indices].copy().astype(np.float32)
             - self.default_pose,
-            self.data.qvel[self.joint_qvel_indices].copy().astype(np.float32),
+            jv,
             self.last_action,
             self.command,
         ]

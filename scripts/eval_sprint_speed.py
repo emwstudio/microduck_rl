@@ -13,13 +13,15 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 
+import numpy as np
 import torch
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", default="Mjlab-Sprint-Flat-MicroDuck")
-    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--checkpoint", default=None)
+    ap.add_argument("--onnx", default=None, help="测 ONNX（归一化已烘焙）而非 .pt checkpoint")
     ap.add_argument("--vx", type=float, nargs="+", default=[0.4, 0.8, 1.2, 1.6, 2.0])
     ap.add_argument("--num-envs", type=int, default=64)
     ap.add_argument("--seconds", type=float, default=8.0)
@@ -39,18 +41,31 @@ def main():
     env = ManagerBasedRlEnv(cfg=env_cfg, device=args.device)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    runner_cls = load_runner_cls(args.task) or MjlabOnPolicyRunner
-    runner = runner_cls(env, asdict(agent_cfg), device=args.device)
-    runner.load(args.checkpoint, load_cfg={"actor": True}, strict=True,
-                map_location=args.device)
-    policy = runner.get_inference_policy(device=args.device)
+    if args.onnx:
+        import onnxruntime as ort
+        session = ort.InferenceSession(args.onnx)
+
+        def policy(obs):
+            vec = obs["actor"].detach().cpu().numpy().astype(np.float32)
+            # 导出的 ONNX batch 维固定为 1，逐 env 推理
+            acts = [session.run(None, {session.get_inputs()[0].name: vec[i : i + 1]})[0]
+                    for i in range(vec.shape[0])]
+            return torch.tensor(np.concatenate(acts, axis=0),
+                                device=args.device, dtype=torch.float32)
+    else:
+        assert args.checkpoint, "--checkpoint or --onnx required"
+        runner_cls = load_runner_cls(args.task) or MjlabOnPolicyRunner
+        runner = runner_cls(env, asdict(agent_cfg), device=args.device)
+        runner.load(args.checkpoint, load_cfg={"actor": True}, strict=True,
+                    map_location=args.device)
+        policy = runner.get_inference_policy(device=args.device)
 
     uw = env.unwrapped
     robot = uw.scene["robot"]
     cmd_term = uw.command_manager.get_term("twist")
     dt = uw.step_dt
 
-    print(f"checkpoint: {args.checkpoint}")
+    print(f"policy: {args.onnx or args.checkpoint}")
     print(f"control dt: {dt:.4f}s  envs: {args.num_envs}  task: {args.task}")
 
     def force_cmd(vx):

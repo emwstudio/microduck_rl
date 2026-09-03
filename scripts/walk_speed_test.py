@@ -37,8 +37,8 @@ d2t = _load_module("d2t", REPO_ROOT / "scripts" / "dance_to_timeline.py")
 infer = _load_module("infer", REPO_ROOT / "scripts" / "infer_policy.py")
 
 SCENE_XML = REPO_ROOT / "src/mjlab_microduck/robot/microduck/scene.xml"
-POLICY = DUCKEMW_ROOT / "artifacts" / "alpha_walking.onnx"
-OUTDIR = DUCKEMW_ROOT / "artifacts" / "walk_probe"
+DEFAULT_POLICY = DUCKEMW_ROOT / "artifacts" / "alpha_walking.onnx"
+DEFAULT_OUTDIR = DUCKEMW_ROOT / "artifacts" / "walk_probe"
 
 SPAWN_Z = d2t.SPAWN_Z               # 0.125，与训练 spawn 一致
 TILT_FALL = d2t.FALL_TILT_THRESHOLD  # 45° 倾斜判摔
@@ -47,9 +47,19 @@ VIN_DROP_GAIN = 0.1                 # infer_policy.py 默认负载压降
 
 
 def main():
+    import argparse
+
     import mujoco
     import onnxruntime as ort
     import imageio.v2 as imageio
+
+    ap = argparse.ArgumentParser(description="Headless walking-policy speed probe (BAM)")
+    ap.add_argument("--policy", type=Path, default=DEFAULT_POLICY)
+    ap.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
+    ap.add_argument("--ladder", type=float, nargs="*", default=[0.2, 0.4, 0.6, 0.8, 1.0])
+    args = ap.parse_args()
+    POLICY = args.policy
+    OUTDIR = args.outdir
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
 
@@ -64,7 +74,7 @@ def main():
 
     session = ort.InferenceSession(str(POLICY))
     assert session.get_inputs()[0].shape[-1] == 61
-    h = d2t.DanceHarness(model, data, session)
+    h = d2t.DanceHarness(model, data, session, joint_vel_delay=1)
 
     fj = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
     qa = int(model.jnt_qposadr[fj])
@@ -162,8 +172,8 @@ def main():
     print("\n=== 原地站立 2s（零命令姿态检查）===")
     run_phase("settle", 0.0, 2.0)
 
-    print("\n=== 速度阶梯（每档 5s，0.2 → 1.0；基线标称 0.4）===")
-    ladder = [0.2, 0.4, 0.6, 0.8, 1.0]
+    print(f"\n=== 速度阶梯（每档 5s，{args.ladder}；策略 {POLICY.name}）===")
+    ladder = list(args.ladder)
     results = []
     for cmd in ladder:
         if fallen:
