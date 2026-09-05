@@ -57,6 +57,8 @@ def main():
     ap.add_argument("--policy", type=Path, default=DEFAULT_POLICY)
     ap.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     ap.add_argument("--ladder", type=float, nargs="*", default=[0.2, 0.4, 0.6, 0.8, 1.0])
+    ap.add_argument("--action-delay", type=int, default=0,
+                    help="动作延迟（物理步数）：训练带 3-6 物理步延迟的策略需要")
     args = ap.parse_args()
     POLICY = args.policy
     OUTDIR = args.outdir
@@ -112,15 +114,22 @@ def main():
     fallen = False
     pos_hist = []
 
+    from collections import deque
+    target_q = deque(maxlen=args.action_delay + 1)
+    target_q.append(h.default_pose.copy())
+
     def step_once(cmd_x, phase):
         nonlocal t, fallen
         h.command[:] = 0.0
         h.command[0] = cmd_x
         action = h.infer()
-        bam_ctrl.q_target[:] = h.default_pose + action * h.action_scale
+        target_q.append(h.default_pose + action * h.action_scale)
         for _ in range(d2t.DECIMATION):
+            bam_ctrl.q_target[:] = target_q[0]
             bam_ctrl.update()
             mujoco.mj_step(model, data)
+            if len(target_q) > 1:
+                target_q.popleft()
         t += d2t.CONTROL_DT
 
         x, y = float(data.qpos[qa]), float(data.qpos[qa + 1])
